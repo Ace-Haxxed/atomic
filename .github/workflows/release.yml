@@ -1,0 +1,120 @@
+name: release
+
+# Publishes a signed native bundle per platform. Tagged pushes only: an untagged
+# run of this workflow would overwrite a released artifact.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  # One release at a time. A second run would race the updater manifest.
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: apps/desktop/src-tauri
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml -- -D warnings
+      - run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
+      - run: cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --check
+
+  build:
+    name: ${{ matrix.label }}
+    needs: verify
+    permissions:
+      contents: write
+    strategy:
+      # A failed platform must not cancel the others; a partial release is
+      # better than none, and the tag can be re-run.
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            label: macOS (Apple silicon)
+            target: aarch64-apple-darwin
+            args: --target aarch64-apple-darwin
+          - os: macos-latest
+            label: macOS (Intel)
+            target: x86_64-apple-darwin
+            args: --target x86_64-apple-darwin
+          - os: windows-latest
+            label: Windows (x64)
+            target: x86_64-pc-windows-msvc
+            args: --target x86_64-pc-windows-msvc
+          - os: ubuntu-22.04
+            label: Linux (x64)
+            target: x86_64-unknown-linux-gnu
+            args: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: apps/desktop/src-tauri
+          key: ${{ matrix.target }}
+
+      - name: Install Linux build dependencies
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
+            libssl-dev libgtk-3-dev libayatana-appindicator3-dev
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Import signing certificate (macOS)
+        if: matrix.os == 'macos-latest'
+        env:
+          # The certificate is a base64 PKCS#12 export stored as a secret.
+          CSC_LINK: ${{ secrets.APPLE_CERTIFICATE }}
+          CSC_KEY_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: echo "$CSC_LINK" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+
+      - name: Build bundle
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Without this the updater manifest is skipped and installed builds
+          # silently stop receiving updates.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: Atomic ${{ github.ref_name }}
+          releaseBody: See the changelog in the repository.
+          releaseDraft: true
+          args: ${{ matrix.args }}

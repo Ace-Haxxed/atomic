@@ -1,0 +1,22 @@
+data: {"id":"070b9a73e4c7ce4d972b3d1bc5d9d618","object":"chat.completion.chunk","created":1790732147,"model":"space-bunny-free","choices":[{"index":0,"delta":{"role":"assistant","name":"Space Bunny","reasoning_content":"We need answer. Need think step by"}}],"usage":null}
+
+data: {"id":"070b9a73e4c7ce4d972b3d1bc5d9d618","object":"chat.completion.chunk","created":1790732147,"model":"space-bunny-free","choices":[{"index":0,"delta":{"role":"assistant","name":"Space Bunny","reasoning_content":" step but perhaps not reveal hidden chain? User asks count r's in strawberry, simple. Need maybe show spelling/count. \"strawberry\": s t r a w b e r r"}}],"usage":null}
+
+data: {"id":"070b9a73e4c7ce4d972b3d1bc5d9d618","object":"chat.completion.chunk","created":1790732147,"model":"space-bunny-free","choices":[{"index":0,"delta":{"role":"assistant","name":"Space Bunny","reasoning_content":" y? Let's spell: strawberry = s t r a w b e r r y. There are r at positions 3, 8, 9 = 3."}}],"usage":null}
+
+data: {"id":"070b9a73e4c7ce4d972b3d1bc5d9d618","object":"chat.completion.chunk","created":1790732147,"model":"space-bunny-free","choices":[{"index":0,"delta":{"role":"assistant","name":"Space Bunny","reasoning_content":" Need answer perhaps concise with steps. They explicitly ask think through step by step. We can provide transparent simple"}}],"usage":null}
+
+data: {"id":"070b9a73e4c7ce4d972b3d1bc5d9d618","object":"chat.completion.chunk","created":1790732147,"model":"space-bunny-free","choices":[{"index":0,"delta":{"role":"assistant","name":"Space Bunny","reasoning_content":" reasoning, no issue. Ensure count. Let's verify: straw + berry: \"straw\" has r 1, \"berry\" begins"}}],"usage":null}
+
+data: {"id":"070b9a73e4c7ce4d972b3d1bc5d9d618","object":"chat.completion.chunk","created":1790732147,"model":"space-bunny-free","choices":[{"index":0,"delta":{"role":"assistant","content":"","name":"Space Bunny","reasoning_content":" b e r r y has 2 r => total 3. Final."}}],"usage":null}
+
+data: {"id":"070b9a73e4c7ce4d972b3d1bc5d9d618","object":"chat.completion.chunk","created":1790732147,"model":"space-bunny-free","choices":[{"index":0,"delta":{"role":"assistant","content":"1. **straw** contains 1 **r**.","name":"Space Bunny"}}],"usage":null}
+
+data: {"id":"070b9a73e4c7ce4d972b3d1bc5d9d618","object":"chat.completion.chunk","created":1790732147,"model":"space-bunny-free","choices":[{"index":0,"finish_reason":"stop","delta":{"role":"assistant","content":"  \n2. **berry** contains 2 **r**’s.  \n3. Total: 1 + 2 = **3 r’s**.","name":"Space Bunny"}}],"usage":null}
+
+data: {"id":"070b9a73e4c7ce4d972b3d1bc5d9d618","object":"chat.completion.chunk","created":1790732147,"model":"space-bunny-free","choices":[],"usage":{"prompt_tokens":180,"completion_tokens":192,"total_tokens":372,"prompt_tokens_details":{"cached_tokens":149},"completion_tokens_details":{"reasoning_tokens":149}}}
+
+data: [DONE]
+
+data: {"choices":[],"cost":"0"}
+

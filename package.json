@@ -1,0 +1,26 @@
+{
+  "name": "atomic",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "packageManager": "pnpm@12.6.0",
+  "engines": {
+    "node": ">=20.19"
+  },
+  "scripts": {
+    "dev": "pnpm --filter @atomic/desktop dev",
+    "build": "pnpm typecheck && pnpm --filter @atomic/desktop build",
+    "typecheck": "tsc -b tsconfig.build.json",
+    "verify": "pnpm typecheck && pnpm test && cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml -- -D warnings && cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --check && cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "tauri": "pnpm --filter @atomic/desktop tauri",
+    "clean": "rimraf packages/*/dist packages/*/*.tsbuildinfo apps/*/dist apps/*/*.tsbuildinfo **/*.tsbuildinfo"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "rimraf": "^6.0.1",
+    "typescript": "7.0.2",
+    "vitest": "^5.0.2"
+  }
+}

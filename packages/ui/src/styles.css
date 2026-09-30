@@ -1,0 +1,216 @@
+/**
+ * Atomic design tokens.
+ *
+ * Colours are declared as raw channel triplets in OKLCH-free RGB space so
+ * Tailwind v4 can apply opacity modifiers (`bg-surface/80`) to any token.
+ * Light and dark are the same token names with different values, so every
+ * component is written once and themes for free.
+ */
+
+@import "tailwindcss";
+
+/*
+ * Explicit sources. Without these, Tailwind v4's automatic detection only walks
+ * the Vite root (`apps/desktop`), so every class that appears solely in
+ * `packages/ui` is dropped from the build. That is silent: the shared Button
+ * lost `inline-flex`, `whitespace-nowrap` and `[&_svg]:size-4`, its icon lost an
+ * explicit size, and every icon+label button wrapped and clipped.
+ *
+ * Paths are relative to this file.
+ */
+@source "../../../apps/desktop/src";
+@source ".";
+
+@theme {
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, "Noto Sans", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+
+  --radius-sm: 0.25rem;
+  --radius-md: 0.375rem;
+  --radius-lg: 0.5rem;
+  --radius-xl: 0.75rem;
+}
+
+/* ---------- light ---------- */
+:root {
+  color-scheme: light;
+
+  --canvas: 250 250 251;
+  --surface: 255 255 255;
+  --surface-raised: 247 247 249;
+  --surface-sunken: 241 241 244;
+
+  --border: 226 226 232;
+  --border-strong: 205 205 214;
+
+  --text: 24 24 27;
+  --text-muted: 92 92 102;
+  --text-subtle: 138 138 150;
+
+  --accent: 79 70 229;
+  --accent-hover: 67 56 202;
+  --accent-foreground: 255 255 255;
+  --accent-subtle: 238 238 253;
+
+  --success: 21 128 61;
+  --success-subtle: 240 253 244;
+  --warning: 180 83 9;
+  --warning-subtle: 255 251 235;
+  --danger: 185 28 28;
+  --danger-subtle: 254 242 242;
+  --info: 29 78 216;
+  --info-subtle: 239 246 255;
+
+  --shadow-color: 24 24 27;
+}
+
+/* ---------- dark ---------- */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --canvas: 12 12 14;
+  --surface: 22 22 26;
+  --surface-raised: 30 30 35;
+  --surface-sunken: 17 17 20;
+
+  --border: 42 42 49;
+  --border-strong: 63 63 72;
+
+  --text: 244 244 246;
+  --text-muted: 168 168 180;
+  --text-subtle: 122 122 136;
+
+  --accent: 129 124 255;
+  --accent-hover: 148 144 255;
+  --accent-foreground: 12 12 14;
+  --accent-subtle: 30 29 56;
+
+  --success: 74 222 128;
+  --success-subtle: 20 45 32;
+  --warning: 251 191 36;
+  --warning-subtle: 55 44 16;
+  --danger: 248 113 113;
+  --danger-subtle: 60 26 26;
+  --info: 96 165 250;
+  --info-subtle: 22 38 66;
+
+  --shadow-color: 0 0 0;
+}
+
+@theme inline {
+  --color-canvas: rgb(var(--canvas));
+  --color-surface: rgb(var(--surface));
+  --color-surface-raised: rgb(var(--surface-raised));
+  --color-surface-sunken: rgb(var(--surface-sunken));
+
+  --color-border-base: rgb(var(--border));
+  --color-border-strong: rgb(var(--border-strong));
+
+  --color-content: rgb(var(--text));
+  --color-content-muted: rgb(var(--text-muted));
+  --color-content-subtle: rgb(var(--text-subtle));
+
+  --color-accent: rgb(var(--accent));
+  --color-accent-hover: rgb(var(--accent-hover));
+  --color-accent-foreground: rgb(var(--accent-foreground));
+  --color-accent-subtle: rgb(var(--accent-subtle));
+
+  --color-success: rgb(var(--success));
+  --color-success-subtle: rgb(var(--success-subtle));
+  --color-warning: rgb(var(--warning));
+  --color-warning-subtle: rgb(var(--warning-subtle));
+  --color-danger: rgb(var(--danger));
+  --color-danger-subtle: rgb(var(--danger-subtle));
+  --color-info: rgb(var(--info));
+  --color-info-subtle: rgb(var(--info-subtle));
+}
+
+/* ---------- base ---------- */
+@layer base {
+  * {
+    border-color: rgb(var(--border));
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    background-color: rgb(var(--canvas));
+    color: rgb(var(--text));
+    font-family: var(--font-sans);
+    font-size: 14px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    /* A desktop app should not feel like a web page: no rubber-banding. */
+    overscroll-behavior: none;
+    user-select: none;
+  }
+
+  /* Text the user may genuinely need to copy. */
+  input,
+  textarea,
+  [data-selectable],
+  pre,
+  code {
+    user-select: text;
+  }
+
+  :focus-visible {
+    outline: 2px solid rgb(var(--accent));
+    outline-offset: 2px;
+    border-radius: 2px;
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: rgb(var(--border-strong) / 0.7);
+    border: 3px solid transparent;
+    background-clip: content-box;
+    border-radius: 999px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgb(var(--text-subtle) / 0.8);
+    background-clip: content-box;
+  }
+}
+
+@layer utilities {
+  /* Native-feeling window chrome: a draggable strip above the app. */
+  .drag-region {
+    -webkit-app-region: drag;
+  }
+
+  .no-drag {
+    -webkit-app-region: no-drag;
+  }
+
+  .font-tabular {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
