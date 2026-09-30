@@ -11,8 +11,9 @@
  * TypeScript would mean a future tool could forget it, and there is no way to
  * write a test that proves a check nobody remembered to call.
  *
- * So: no method here takes an absolute path, and every method takes the
- * workspace root and a relative path. There is deliberately no escape hatch.
+ * So: every method here takes the list of authorized roots and a path, and the
+ * host re-checks that path against the real filesystem on every call. There is
+ * deliberately no "trust me" variant.
  */
 
 export interface FileEntry {
@@ -88,6 +89,30 @@ export interface FileSystemPort {
     pattern: string,
     options?: { glob?: string; caseSensitive?: boolean; maxMatches?: number },
   ): Promise<GrepResult>;
+}
+
+/**
+ * Widening the set of folders a conversation may use.
+ *
+ * Narrow on purpose. A tool that could write settings would be able to change
+ * any setting, and the next one to need a field would be one line away from
+ * changing permission levels too. This port does the one thing the agent needs
+ * and nothing else: check that a path is a real directory, and if it is, add it
+ * to the list.
+ *
+ * The *decision* to call it is not made here. The permission gate has already
+ * ruled on it by the time this runs, so a host implementing this port does not
+ * need to know about prompts, and cannot be asked to make that call.
+ */
+export interface FolderAccessPort {
+  /**
+   * Authorize a folder for every conversation.
+   *
+   * Returns the canonical path when it worked. A path that is already
+   * authorized is a success, not an error -- the agent asking twice should not
+   * read as a failure.
+   */
+  authorize(path: string): Promise<{ ok: true; path: string } | { ok: false; reason: string }>;
 }
 
 /** Process execution, always rooted at the workspace. */

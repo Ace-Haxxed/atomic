@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { AgentLoop } from "./loop.js";
 import { AgentEventBus, type AgentEvent } from "./events.js";
 import { ApprovalBroker } from "./approval.js";
@@ -9,6 +9,9 @@ import type { Provider, ModelRequest, StreamEvent } from "../models/provider.js"
 import { SettingsSchema } from "../settings/schema.js";
 import { EMPTY_USAGE, type FinishReason } from "../models/types.js";
 import type { TurnCostReview } from "../models/free-policy.js";
+import { describePlatform, type PlatformInfo } from "../platform/platform.js";
+
+const linux: PlatformInfo = describePlatform("linux", "x86_64", "Arch Linux");
 
 /**
  * A provider that fails for a chosen set of models, so the fallback path can be
@@ -707,5 +710,292 @@ describe("a run that hits the output-token limit", () => {
       providerReturning({ text: "done", finishReason: "stop" }),
     );
     expect(result.reason).toBe("stop");
+  });
+});
+
+/**
+ * A folder approved partway through a run has to work in that same run.
+ *
+ * This is the whole reason `extraRoots` is a function rather than an array. With
+ * a value captured when the run starts, the sequence below -- ask, get approved,
+ * read a file in the new folder -- would authorize the folder, report success,
+ * and then have the very next call refused for being "outside every folder". The
+ * user would have clicked Approve and seen nothing happen, which is worse than
+ * not having offered.
+ */
+describe("a folder added mid-run", () => {
+  const EXTRA = "/home/me/Code";
+
+  /**
+   * Calls `add_folder`, then `read_file` in whatever folder it just added, then
+   * answers. The second step is the one that matters: it is the call whose
+   * `extraRoots` decides whether the approval reached anything.
+   */
+  function folderThenReadProvider(): Provider {
+    let turn = 0;
+    return {
+      id: "zen",
+      name: "Test",
+      baseUrl: "http://test.invalid/v1",
+      async listModels() {
+        return { models: [], fetchedAt: 0, source: "fallback" };
+      },
+      async complete() {
+        return { message: { role: "assistant", content: [] }, usage: EMPTY_USAGE };
+      },
+      // eslint-disable-next-line require-yield
+      async *stream(): AsyncIterable<StreamEvent> {
+        turn += 1;
+        if (turn === 1) {
+          const args = { path: EXTRA };
+          yield {
+            type: "tool-call-end" as const,
+            index: 0,
+            call: { id: "c1", name: "add_folder", args, rawArgs: JSON.stringify(args) },
+          } as StreamEvent;
+        } else if (turn === 2) {
+          const args = { path: "README.md" };
+          yield {
+            type: "tool-call-end" as const,
+            index: 0,
+            call: { id: "c2", name: "read_file", args, rawArgs: JSON.stringify(args) },
+          } as StreamEvent;
+        } else {
+          yield { type: "text-delta" as const, text: "done" } as StreamEvent;
+        }
+        yield { type: "done" as const, usage: EMPTY_USAGE } as StreamEvent;
+      },
+      supportsModel() {
+        return true;
+      },
+    };
+  }
+
+  it("is usable by the next tool call in the same run", async () => {
+    const registry = new ToolRegistry();
+    const roots: string[] = [];
+    const readPaths: string[] = [];
+
+    registry.register({
+      name: "add_folder",
+      description: "Ask to use a folder",
+      parameters: { type: "object", properties: { path: { type: "string" } } },
+      categories: ["folder-access"],
+      modes: ["code"],
+      execute: async (args) => {
+        roots.push(String(args.path));
+        return { content: "added" };
+      },
+    });
+    registry.register({
+      name: "read_file",
+      description: "Read a file",
+      parameters: { type: "object", properties: { path: { type: "string" } } },
+      categories: ["file-read"],
+      modes: ["code"],
+      execute: async (args, ctx) => {
+        readPaths.push(String(args.path));
+        // The roots the tool is handed, which is where the new folder has to be.
+        return { content: `roots=${ctx.extraRoots().join(",")}` };
+      },
+    });
+
+    // The same shape the host passes: a function, so it re-reads per call.
+    const loop = new AgentLoop({
+      provider: folderThenReadProvider(),
+      registry,
+      gate: new PermissionGate(
+        () => SettingsSchema.parse({ permissions: { code: { level: "ask" } } }),
+        { platform: linux },
+      ),
+      events: new AgentEventBus(),
+      approval: new ApprovalBroker(),
+    });
+
+    const result = await loop.run({
+      conversationId: "c1",
+      runId: "r1",
+      mode: "code",
+      model: "m",
+      system: undefined,
+      messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+      workspace: "/ws",
+      extraRoots: () => roots,
+      signal: new AbortController().signal,
+      // The user approves, as they would after reading the prompt.
+      approve: async () => true,
+    });
+
+    expect(result.reason).toBe("stop");
+    expect(roots).toEqual([EXTRA]);
+    // The point of the whole feature: the very next call in this run saw the new
+    // folder. With roots captured at the start of the run this list would be
+    // empty, and the user would have approved a folder that then did nothing.
+    expect(readPaths).toEqual(["README.md"]);
+    const toolText = result.messages
+      .flatMap((message) => (Array.isArray(message.content) ? message.content : []))
+      .map((part) => ("text" in part ? part.text : ""))
+      .join("\n");
+    expect(toolText).toContain(`roots=${EXTRA}`);
+  });
+
+  it("is not usable by the next call if the user denies it", async () => {
+    const registry = new ToolRegistry();
+    const roots: string[] = [];
+    let asked = 0;
+
+    registry.register({
+      name: "add_folder",
+      description: "Ask to use a folder",
+      parameters: { type: "object", properties: { path: { type: "string" } } },
+      categories: ["folder-access"],
+      modes: ["code"],
+      execute: async (args) => {
+        roots.push(String(args.path));
+        return { content: "added" };
+      },
+    });
+    registry.register({
+      name: "read_file",
+      description: "Read a file",
+      parameters: { type: "object", properties: { path: { type: "string" } } },
+      categories: ["file-read"],
+      modes: ["code"],
+      execute: async (args, ctx) => {
+        asked += 1;
+        return { content: `roots=${ctx.extraRoots().join(",")}` };
+      },
+    });
+
+    const loop = new AgentLoop({
+      provider: folderThenReadProvider(),
+      registry,
+      gate: new PermissionGate(
+        () => SettingsSchema.parse({ permissions: { code: { level: "ask" } } }),
+        { platform: linux },
+      ),
+      events: new AgentEventBus(),
+      approval: new ApprovalBroker(),
+    });
+
+    await loop.run({
+      conversationId: "c1",
+      runId: "r1",
+      mode: "code",
+      model: "m",
+      system: undefined,
+      messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+      workspace: "/ws",
+      extraRoots: () => roots,
+      signal: new AbortController().signal,
+      approve: async () => false,
+    });
+
+    // Nothing was added, so nothing downstream can act on it.
+    expect(roots).toEqual([]);
+    expect(asked).toBe(0);
+  });
+});
+
+/**
+ * "Allow always" has to mean allow.
+ *
+ * The approval card has always offered it, and the loop compared the broker's
+ * answer against `"allow"` alone -- so `"allow-always"`, the value that button
+ * sends, scored as a refusal. The user clicked the button that says yes, watched
+ * the action be reported as denied, and had no way to tell the difference between
+ * the agent ignoring them and the app being broken.
+ */
+describe("resolving a tool approval", () => {
+  function approvingProvider(): Provider {
+    let turn = 0;
+    return {
+      id: "zen",
+      name: "Test",
+      baseUrl: "http://test.invalid/v1",
+      async listModels() {
+        return { models: [], fetchedAt: 0, source: "fallback" };
+      },
+      async complete() {
+        return { message: { role: "assistant", content: [] }, usage: EMPTY_USAGE };
+      },
+      // eslint-disable-next-line require-yield
+      async *stream(): AsyncIterable<StreamEvent> {
+        turn += 1;
+        if (turn === 1) {
+          const args = { path: "notes.txt" };
+          yield {
+            type: "tool-call-end" as const,
+            index: 0,
+            call: { id: "c1", name: "write_file", args, rawArgs: JSON.stringify(args) },
+          } as StreamEvent;
+        } else {
+          yield { type: "text-delta" as const, text: "done" } as StreamEvent;
+        }
+        yield { type: "done" as const, usage: EMPTY_USAGE } as StreamEvent;
+      },
+      supportsModel() {
+        return true;
+      },
+    };
+  }
+
+  async function runWithDecision(decision: "allow" | "allow-always" | "deny") {
+    const registry = new ToolRegistry();
+    const written: string[] = [];
+    registry.register({
+      name: "write_file",
+      description: "Write a file",
+      parameters: { type: "object", properties: { path: { type: "string" } } },
+      categories: ["file-write"],
+      modes: ["code"],
+      execute: async (args) => {
+        written.push(String(args.path));
+        return { content: "written" };
+      },
+    });
+
+    const approval = new ApprovalBroker();
+    const loop = new AgentLoop({
+      provider: approvingProvider(),
+      registry,
+      gate: new PermissionGate(
+        () => SettingsSchema.parse({ permissions: { code: { level: "ask" } } }),
+        { platform: linux },
+      ),
+      events: new AgentEventBus(),
+      approval,
+    });
+
+    const pending = loop.run({
+      conversationId: "c1",
+      runId: "r1",
+      mode: "code",
+      model: "m",
+      system: undefined,
+      messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+      workspace: "/ws",
+      signal: new AbortController().signal,
+    });
+
+    // Resolve as soon as the card would have been shown, rather than racing it.
+    await vi.waitFor(() => expect(approval.list().length).toBe(1));
+    expect(approval.resolve("c1", decision)).toBe(true);
+    return { result: await pending, written };
+  }
+
+  it("runs the action when the user picks Allow", async () => {
+    const { written } = await runWithDecision("allow");
+    expect(written).toEqual(["notes.txt"]);
+  });
+
+  it("runs the action when the user picks Allow always", async () => {
+    const { written } = await runWithDecision("allow-always");
+    expect(written).toEqual(["notes.txt"]);
+  });
+
+  it("does not run the action when the user picks Deny", async () => {
+    const { written } = await runWithDecision("deny");
+    expect(written).toEqual([]);
   });
 });

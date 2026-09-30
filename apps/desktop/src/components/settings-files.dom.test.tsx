@@ -191,10 +191,61 @@ describe("folders allowed under Settings > Files", () => {
     expect(screen.queryByText(CODE)).not.toBeInTheDocument();
   });
 
-  it("explains that the model cannot add folders itself", async () => {
+  it("offers both ways in: the user adds one, or the agent asks", async () => {
     const { api } = stubApi();
     await openPanel(api);
-    expect(await screen.findByText(/cannot add one itself/i)).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: /add folder/i })).toBeInTheDocument();
+    expect(screen.getByLabelText(/let the agent ask for folders/i)).toBeInTheDocument();
+  });
+
+  it("defaults to asking, and to the agent not being able to add one alone", async () => {
+    // The two defaults are the whole security posture, so they are asserted
+    // against the schema rather than against this component: a form that renders
+    // the right switches while the defaults underneath are permissive would look
+    // correct and be the opposite.
+    const files = DEFAULT_SETTINGS.files;
+    expect(files.agentCanRequestFolders).toBe(true);
+    expect(files.agentAddsFoldersWithoutAsking).toBe(false);
+  });
+
+  it("turning autonomy on is written", async () => {
+    const { api, writes } = stubApi();
+    await openPanel(api);
+
+    await userEvent.click(await screen.findByLabelText(/add requested folders without asking/i));
+    expect(writes.at(-1)?.files.agentAddsFoldersWithoutAsking).toBe(true);
+  });
+
+  it("shows the stored autonomy value on a later visit, and can turn it back off", async () => {
+    // A switch that resets to its default on reopen would leave the user
+    // believing they had turned something on that was not on -- the worst
+    // failure mode a settings switch has, because nothing looks broken.
+    const stored = SettingsSchema.parse({ files: { agentAddsFoldersWithoutAsking: true } });
+    const { api, writes } = stubApi();
+    await openPanel(api, stored);
+
+    const toggle = await screen.findByLabelText(/add requested folders without asking/i);
+    expect(toggle).toBeChecked();
+
+    await userEvent.click(toggle);
+    expect(writes.at(-1)?.files.agentAddsFoldersWithoutAsking).toBe(false);
+  });
+
+  it("turning requests off hides the autonomy switch, which would be meaningless", async () => {
+    // Autonomy with requesting off describes a capability that does not exist.
+    // Leaving it visible would be a switch that appears to grant something and
+    // grants nothing.
+    const stored = SettingsSchema.parse({ files: { agentCanRequestFolders: false } });
+    const { api, writes } = stubApi();
+    const { user } = await openPanel(api, stored);
+
+    expect(await screen.findByLabelText(/let the agent ask for folders/i)).not.toBeChecked();
+    expect(screen.queryByLabelText(/add requested folders without asking/i)).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByLabelText(/let the agent ask for folders/i));
+    expect(writes.at(-1)?.files.agentCanRequestFolders).toBe(true);
+    // Turning requesting back on reveals the switch again, off.
+    expect(await screen.findByLabelText(/add requested folders without asking/i)).not.toBeChecked();
   });
 
   it("starts from folders already stored, without rewriting them", async () => {

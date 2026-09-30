@@ -1200,6 +1200,8 @@ function FilesCard({
   // removed elsewhere. Adding it a second time would be a no-op that looks like a
   // success, so it is refused here with a reason rather than silently accepted.
   const [error, setError] = useState<string | null>(null);
+  const canRequest = settings.files?.agentCanRequestFolders ?? true;
+  const autonomous = settings.files?.agentAddsFoldersWithoutAsking ?? false;
 
   const add = async () => {
     setError(null);
@@ -1225,8 +1227,8 @@ function FilesCard({
       <CardBody className="space-y-2">
         <p className="text-[11px] text-content-muted">
           The agent can read and write inside the folder you open for a chat. Add
-          folders here to let it work in those too -- it can use a folder you have
-          listed, but it cannot add one itself.
+          folders here to let it work in those too, or let it ask for one while it
+          works.
         </p>
         {folders.length === 0 ? (
           <p className="text-[11px] text-content-muted">
@@ -1262,6 +1264,29 @@ function FilesCard({
         <Button size="sm" variant="ghost" onClick={() => void add()}>
           Add folder
         </Button>
+
+        <Separator />
+
+        <Switch
+          label="Let the agent ask for folders"
+          description="It requests a folder mid-task and you approve or deny it. Off means only folders you add here are usable."
+          checked={canRequest}
+          onCheckedChange={(value) => void onPatch({ files: { agentCanRequestFolders: value } })}
+        />
+        {/*
+          Only meaningful when requesting is on at all, and shown second so the
+          order matches the escalation: it can ask, then it need not wait.
+        */}
+        {canRequest ? (
+          <Switch
+            label="Add requested folders without asking"
+            description="No prompt. A folder the agent names becomes usable immediately -- including one it was talked into by a file it read. Denied folders are still refused."
+            checked={autonomous}
+            onCheckedChange={(value) =>
+              void onPatch({ files: { agentAddsFoldersWithoutAsking: value } })
+            }
+          />
+        ) : null}
       </CardBody>
     </Card>
   );

@@ -13,6 +13,8 @@ import {
   LocalHost,
   SettingsStore,
   ToolRegistry,
+  createFolderTools,
+  withFolder,
   setProviderDiagnostics,
   databasePath,
   deriveAppDirs,
@@ -22,6 +24,7 @@ import {
   type AppDirs,
   type Database,
   type CheckpointRunInfo,
+  type FolderAccessPort,
   type HostApi,
   type HostServices,
   type PlatformInfo,
@@ -166,6 +169,46 @@ async function start(): Promise<Bootstrap> {
   const audit = new AuditLog(db);
   const registry = new ToolRegistry();
 
+  /**
+   * The `add_folder` implementation, and the only code path where a folder the
+   * agent named becomes one the app will read.
+   *
+   * Two steps in a fixed order, and the order is the safety property: Rust
+   * decides whether the path is a real, permitted folder, and only then is
+   * anything written. A failed check leaves settings exactly as they were, so a
+   * refused request cannot leave a root behind for the next run to find.
+   *
+   * The permission decision is not made here. By the time this runs the gate has
+   * already ruled -- the user approved the prompt, or autonomy is on -- and this
+   * function has no way to be asked to make that call.
+   */
+  const folders: FolderAccessPort = {
+    authorize: async (path: string) => {
+      // Verified in Rust, not here: the check needs the real filesystem, and a
+      // TypeScript version would be a second implementation of a rule that has
+      // to be right. It canonicalizes, so a symlink is judged by where it points.
+      const check = await call<{ ok: boolean; path?: string; reason?: string }>("check_folder", {
+        path,
+      });
+      if (!check.ok || !check.path) {
+        return { ok: false, reason: check.reason ?? `"${path}" could not be used.` };
+      }
+
+      const current = settings.get().files.allowedFolders;
+      const next = withFolder(current, check.path, platform);
+      // Already authorized. Success, not failure: the agent asking twice should
+      // not read as something having gone wrong.
+      if (!next) return { ok: true, path: check.path };
+
+      // Written through the store, so listeners fire and the value survives a
+      // restart. A write that fails here throws, and the folder is *not* added --
+      // better a clear failure than a tool result claiming access that the next
+      // run will not find.
+      await settings.patch({ files: { allowedFolders: next } });
+      return { ok: true, path: check.path };
+    },
+  };
+
   const services: HostServices = {
     platform,
     shell,
@@ -236,6 +279,30 @@ async function start(): Promise<Bootstrap> {
   };
 
   const api = new LocalHost({ db, secrets, settings, services, registry, audit });
+
+  /*
+   * Keep `add_folder` in step with the setting that governs it.
+   *
+   * After the host, deliberately. `LocalHost` registers the Code tools only when
+   * the registry is still empty, so registering anything first would suppress
+   * every other tool rather than just adding one.
+   *
+   * The tool is added and removed rather than always present and always refused:
+   * a model that can see a capability is a model that keeps calling it, and one
+   * that has been told the agent may not do this should not be left to discover
+   * that from refusals.
+   */
+  const addFolderTools = createFolderTools({ folders });
+  const syncFolderTool = () => {
+    const allowed = settings.get().files.agentCanRequestFolders;
+    if (allowed && !registry.has("add_folder")) {
+      for (const tool of addFolderTools) registry.register(tool);
+      return;
+    }
+    if (!allowed) registry.unregister("add_folder");
+  };
+  syncFolderTool();
+  settings.subscribe(syncFolderTool);
 
   // Bypass is dangerous enough to deserve one audit line and a visible banner.
   if (isBypassActive(settings.get() as Settings)) {

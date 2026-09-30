@@ -108,6 +108,7 @@ import {
   UNAVAILABLE_FILE_SYSTEM,
   UNAVAILABLE_PROCESS,
   type CheckpointPort,
+  type FolderAccessPort,
   type FileSystemPort,
   type ProcessPort,
 } from "./ports.js";
@@ -142,6 +143,15 @@ export interface HostServices {
   readonly process?: ProcessPort;
   /** Absent in a host with no Code support; the write tools then have no undo. */
   readonly checkpoints?: CheckpointPort;
+  /**
+   * Authorizing a folder the agent asked for.
+   *
+   * Absent when the user has switched agent-requested folders off, which is also
+   * what keeps `add_folder` out of the model's tool list -- a capability the
+   * user turned off should be invisible to the model rather than present and
+   * always refused.
+   */
+  readonly folders?: FolderAccessPort;
   /** Model ids the user's own keys can reach, keyed by model id. */
   ownKeys?: Readonly<Record<string, string>>;
   /**
@@ -221,6 +231,13 @@ export class LocalHost implements HostApi {
    * Registration is skipped rather than stubbed when a port is missing, so a
    * host without a filesystem gets a model that is honestly told it cannot read
    * files, instead of one handed tools that fail at call time.
+   *
+   * The folder tool is registered whenever the host *can* authorize folders and
+   * left out otherwise, rather than registered always and gated per call. A model
+   * whose tool list names a capability that always refuses will keep calling it;
+   * one that never heard of it moves on. The setting that decides whether a
+   * request needs a prompt is read per call instead, by the gate, so flipping it
+   * takes effect without re-registering anything.
    */
   #registerCodeTools(): void {
     const fs = this.#services.fs;
@@ -229,6 +246,7 @@ export class LocalHost implements HostApi {
     if (this.#registry.names("code").length > 0) return;
 
     const todos = new TodoRepository(this.#db);
+    const folders = this.#services.folders;
     this.#registry.registerAll(
       createCodeTools({
         fs,
@@ -244,6 +262,7 @@ export class LocalHost implements HostApi {
               settings: () => this.#settings.get(),
             }
           : undefined,
+        ...(folders ? { folders } : {}),
       }),
     );
   }
@@ -1704,11 +1723,14 @@ export class LocalHost implements HostApi {
         system,
         messages: modelMessages,
         workspace: conversation.workspace,
-        // Passed through as the user stored them. Both consumers of this list --
-        // the permission gate and the file tools -- only ever widen containment,
-        // so a folder that also happens to be the workspace is harmless here and
-        // is normalized once, where the roots are actually combined.
-        extraRoots: settings.files?.allowedFolders ?? [],
+        // A function, not a snapshot. The agent can ask for a folder partway
+        // through this very run and the user can approve it, and the next tool
+        // call has to see the result -- otherwise the approval appears to do
+        // nothing until the next message, which is worse than not having it.
+        //
+        // Read through the store rather than through the `settings` captured
+        // above, for the same reason.
+        extraRoots: () => this.#settings.get().files.allowedFolders,
         signal: controller.signal,
         // Only an auto-selected model may be substituted. A model the user picked
         // answers with itself or not at all.

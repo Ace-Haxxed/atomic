@@ -2,11 +2,14 @@
  * Which folders a file tool is allowed to touch.
  *
  * A path is authorized if it resolves inside *any* root on this list, and the
- * list has exactly two possible sources: the folder the user opened for this
- * conversation, and folders the user added in Settings. There is deliberately no
- * third source. A model that could propose a root would be able to read anything
- * on the machine by asking for it, so the model never gets to name one -- it can
- * only name a path, and the path is checked against roots the user chose.
+ * list has three possible sources: the folder the user opened for this
+ * conversation, folders the user added in Settings, and -- once the user has
+ * either approved the request or switched on autonomy -- folders the agent asked
+ * for. All three end up in the same place, because a folder that is authorized
+ * should behave identically afterwards no matter how it got there.
+ *
+ * What the model cannot do is widen the list on its own. It names a path; the
+ * user, or the user's own autonomy setting, is what turns that into a root.
  *
  * The workspace comes first, and that order is load-bearing rather than
  * incidental. When a path lies inside more than one root -- a workspace of
@@ -16,6 +19,8 @@
  */
 
 import type { Settings } from "./schema.js";
+import type { PlatformInfo } from "../platform/platform.js";
+import { normalizePath } from "../platform/paths.js";
 
 /**
  * The roots in effect for a conversation, most general first.
@@ -51,4 +56,34 @@ export function authorizedRoots(
 /** True when the user has widened file access beyond the open workspace. */
 export function hasAllowedFolders(settings: Settings): boolean {
   return (settings.files?.allowedFolders?.length ?? 0) > 0;
+}
+
+/**
+ * Add a folder to the list, or return `null` when it is already there.
+ *
+ * `null` rather than the unchanged list, so a caller can tell "added" from
+ * "already authorized" -- the agent asking twice is not a failure, and saying so
+ * is more useful to it than an error would be.
+ *
+ * Compared through `normalizePath`, the same function `isPathInside` uses, rather
+ * than by lower-casing. Those differ on Linux, where `/home/me/Code` and
+ * `/home/me/code` are two real folders: case-folding them would drop the second
+ * from the list and the agent would be told it was added when nothing changed.
+ *
+ * What is stored is the path as given, with only trailing separators removed.
+ * The caller is expected to pass a canonical path from the host, and rewriting
+ * the spelling here would store something the filesystem never confirmed.
+ */
+export function withFolder(
+  allowedFolders: readonly string[],
+  folder: string,
+  platform: PlatformInfo,
+): readonly string[] | null {
+  const trimmed = folder.trim().replace(/[/\\]+$/, "");
+  if (!trimmed) return null;
+  const key = normalizePath(trimmed, platform);
+  const already = allowedFolders.some(
+    (existing) => normalizePath(existing.trim().replace(/[/\\]+$/, ""), platform) === key,
+  );
+  return already ? null : [...allowedFolders, trimmed];
 }

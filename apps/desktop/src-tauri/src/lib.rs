@@ -8,6 +8,7 @@
 mod attachments;
 mod checkpoint_commands;
 mod commands;
+mod folder_commands;
 mod fs_commands;
 mod process_commands;
 mod secrets;
@@ -101,6 +102,7 @@ pub fn run() {
             fs_commands::fs_list,
             fs_commands::fs_glob,
             fs_commands::fs_grep,
+            folder_commands::check_folder,
             process_commands::process_run,
             process_commands::git_run,
             process_commands::git_is_repository,

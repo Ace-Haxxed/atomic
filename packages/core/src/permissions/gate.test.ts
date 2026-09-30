@@ -336,3 +336,140 @@ describe("tool results", () => {
     expect(fail("broken").isError).toBe(true);
   });
 });
+
+/*
+ * `add_folder`: the one tool whose whole purpose is to name a path that is not
+ * yet inside any root.
+ *
+ * That makes it the only tool the containment rule cannot apply to, and the only
+ * one with a switch that skips the prompt. Both exemptions are tested here from
+ * the model's side -- a path it names, and what the gate does with it -- because
+ * a test that only checked the settings round-trip would pass just as happily if
+ * the gate stopped consulting them.
+ */
+describe("the agent asking for a folder", () => {
+  const ask = makeTool({
+    name: "add_folder",
+    description: "Ask to use a folder",
+    parameters: { type: "object", properties: { path: { type: "string" } } },
+    categories: ["folder-access"],
+  });
+
+  const settingsWith = (files: Record<string, unknown>, code: Record<string, unknown> = {}) =>
+    SettingsSchema.parse({ files, permissions: { code } });
+
+  it("asks, rather than refusing a path outside every root", () => {
+    // The failure this guards against is subtle: containment is what stops
+    // `read_file` reaching `~/.ssh`, and applying it here unchanged would refuse
+    // every call this tool could ever make. The result would be a tool that can
+    // only ever fail, offered to the model on every single run.
+    const gate = gateFor(settingsWith({}, { level: "ask" }));
+    const outcome = gate.check(request("code", ask, { path: "/home/me/Code" }));
+    expect(outcome.decision).toBe("ask");
+  });
+
+  it("says what approving actually does", () => {
+    // "Access `/home/me/.ssh`" reads like one read. It is not one: it is the
+    // folder becoming usable in every conversation from now on. The prompt is
+    // the only place that difference can be communicated, so it has to be here.
+    const gate = gateFor(settingsWith({}, { level: "ask" }));
+    const outcome = gate.check(request("code", ask, { path: "/home/me/Code" }));
+    expect(outcome.reason).toContain("from now on");
+    expect(outcome.reason).toContain("/home/me/Code");
+  });
+
+  it("carries the agent's stated reason into the prompt", () => {
+    const gate = gateFor(settingsWith({}, { level: "ask" }));
+    const outcome = gate.check(
+      request("code", ask, { path: "/home/me/Code", reason: "the project you named" }),
+    );
+    expect(outcome.reason).toContain("the project you named");
+  });
+
+  it("does not ask at all when the user has granted autonomy", () => {
+    const gate = gateFor(settingsWith({ agentAddsFoldersWithoutAsking: true }, { level: "ask" }));
+    const outcome = gate.check(request("code", ask, { path: "/home/me/Code" }));
+    expect(outcome.decision).toBe("allow");
+    expect(outcome.rule).toBe("folder_autonomy");
+  });
+
+  it("still refuses a path the user has denied, even under autonomy", () => {
+    // The load-bearing one. Autonomy is a switch about prompts, not about
+    // overrides: a path on the deny list is refused before the autonomy rule is
+    // ever consulted, so turning autonomy on cannot become the way around it.
+    // Without this ordering the switch would quietly un-deny everything.
+    const gate = gateFor(
+      settingsWith(
+        { agentAddsFoldersWithoutAsking: true },
+        { level: "ask", deniedPaths: ["/home/me/private"] },
+      ),
+    );
+    const denied = gate.check(request("code", ask, { path: "/home/me/private/secrets" }));
+    expect(denied.decision).toBe("deny");
+    expect(denied.rule).toBe("denied_path");
+
+    const allowed = gate.check(request("code", ask, { path: "/home/me/Code" }));
+    expect(allowed.decision).toBe("allow");
+  });
+
+  it("still refuses a denied path when the folder is already authorized", () => {
+    // Belt and braces on the same rule: an already-allowed root must not become
+    // a way past a deny entry nested inside it.
+    const gate = gateFor(
+      settingsWith({}, { level: "ask", deniedPaths: ["/home/me/Code/vendor"] }),
+    );
+    const outcome = gate.check(
+      request("code", ask, { path: "/home/me/Code/vendor" }, "/ws", ["/home/me/Code"]),
+    );
+    expect(outcome.decision).toBe("deny");
+    expect(outcome.rule).toBe("denied_path");
+  });
+
+  it("is refused in plan mode, because a plan does not change the machine", () => {
+    const gate = gateFor(settingsWith({ agentAddsFoldersWithoutAsking: true }, { level: "plan" }));
+    const outcome = gate.check(request("code", ask, { path: "/home/me/Code" }));
+    expect(outcome.decision).toBe("deny");
+    expect(outcome.rule).toBe("plan_mode");
+  });
+
+  it("is not waved through by auto-accepting file edits", () => {
+    // `auto-accept` means "stop asking about edits inside folders already open".
+    // It has never meant "open new folders", and a category mapping that let it
+    // cover this would be a much larger grant than the switch's own label.
+    const gate = gateFor(settingsWith({}, { level: "auto-accept" }));
+    const outcome = gate.check(request("code", ask, { path: "/home/me/Code" }));
+    expect(outcome.decision).toBe("ask");
+  });
+
+  it("is not waved through by the file-write auto-approve toggle", () => {
+    // Same reasoning, one level down. A user who checked "auto-approve file
+    // writes" agreed to edits in folders already open, not to new roots.
+    const gate = gateFor(settingsWith({}, { level: "ask", autoApprove: { fileWrite: true } }));
+    const outcome = gate.check(request("code", ask, { path: "/home/me/Code" }));
+    expect(outcome.decision).toBe("ask");
+  });
+
+  it("is allowed under bypass, as everything else is", () => {
+    const gate = gateFor(settingsWith({}, { level: "bypass" }));
+    expect(gate.check(request("code", ask, { path: "/home/me/Code" })).decision).toBe("allow");
+  });
+
+  it("leaves ordinary tools' containment alone", () => {
+    // The exemption is scoped to this tool by name. If it leaked, every tool
+    // would be able to name any path and the sandbox would be gone.
+    const gate = gateFor(settingsWith({ agentAddsFoldersWithoutAsking: true }, { level: "ask" }));
+    const read = gate.check(
+      request("code", makeTool({ categories: ["file-read"] }), { path: "/etc/passwd" }),
+    );
+    expect(read.decision).toBe("deny");
+    expect(read.rule).toBe("outside_workspace");
+  });
+
+  it("offers no allow-list suggestion, since a folder is not a pattern", () => {
+    // "Always allow" would have to add something to `allowedPaths`, and what it
+    // would add is the one path the user just approved -- turning a single yes
+    // into a standing rule for that folder.
+    const gate = gateFor(settingsWith({}, { level: "ask" }));
+    expect(gate.check(request("code", ask, { path: "/home/me/Code" })).allowSuggestion).toBeUndefined();
+  });
+});

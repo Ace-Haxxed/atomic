@@ -7,11 +7,13 @@
  *
  * Decision order (first match wins):
  *   1. plan mode       -> only read-only tools, everything else is denied
- *   2. deny list      -> denied, even in bypass
- *   3. not in workspace -> denied
+ *   2. deny list      -> denied, even in bypass and even in folder autonomy
+ *   3. not in workspace -> denied, except for a tool that is asking to widen
+ *                         access, which is the whole point of that tool
  *   4. allow list     -> allowed
- *   5. level          -> ask | auto-accept | bypass
- *   6. category auto-approve
+ *   5. folder autonomy -> a requested folder is added without a prompt
+ *   6. level          -> ask | auto-accept | bypass
+ *   7. category auto-approve
  */
 
 import { globToRegExp, matchesAnyGlob } from "./glob.js";
@@ -149,7 +151,15 @@ export class PermissionGate {
     //    inside neither is refused here and again by the host, and the reason
     //    says which folders were actually open so the user can be told what to
     //    add rather than left guessing.
-    if (path && resolvedPath) {
+    //
+    //    The one tool this does not apply to is the one whose entire purpose is
+    //    to name a path that is not yet inside any root. Applying the rule to it
+    //    would refuse every call it could ever make, which is a refusal with no
+    //    fix available to the model and no meaning to the user. The deny lists
+    //    above still apply, and the rule below still applies -- what changes is
+    //    only that this path is not *assumed* to be authorized, and the prompt
+    //    is what decides it.
+    if (path && resolvedPath && !isFolderAccess(tool.name)) {
       const roots = [request.workspace, ...(request.extraRoots ?? [])].filter(
         (root): root is string => typeof root === "string" && root.length > 0,
       );
@@ -185,7 +195,23 @@ export class PermissionGate {
       }
     }
 
-    // 5. Level.
+    // 5. Autonomy, for the one tool that widens access rather than acting within
+    //    it. Checked here, after the deny lists and the allow lists, so that
+    //    turning it on cannot become a way around a path the user refused: a
+    //    denied path is refused above and is not revisited here.
+    //
+    //    Bypass is below and would also allow this, but relying on "nothing asks
+    //    at all" for a capability this specific is not the same as the user
+    //    having said yes to *this folder*, and the switch is the honest place to
+    //    record that they did.
+    if (isFolderAccess(tool.name) && settings.files.agentAddsFoldersWithoutAsking) {
+      return allow(
+        "folder_autonomy",
+        "The agent is allowed to add folders without asking.",
+      );
+    }
+
+    // 6. Level.
     if (level === "bypass") {
       return allow("bypass", "Permissions are bypassed for this mode.");
     }
@@ -194,14 +220,14 @@ export class PermissionGate {
       return allow("read_only", "Read-only tools do not need approval.");
     }
 
-    // 6. Per-category auto-approve.
+    // 7. Per-category auto-approve.
     for (const category of tool.categories) {
       if (autoApproved(policy.autoApprove, category)) {
         return allow(`auto_${category}`, `${category} actions are auto-approved for this mode.`);
       }
     }
 
-    // 7. Auto-accept covers file edits only. Shell, network, browser and MCP
+    // 8. Auto-accept covers file edits only. Shell, network, browser and MCP
     //    calls can leave the machine in a state the user cannot see, so they
     //    still prompt. Bypass is the level that stops asking.
     if (level === "auto-accept") {
@@ -229,6 +255,12 @@ function autoApproved(autoApprove: Record<string, boolean>, category: ToolCatego
   // them outright, and a per-category toggle here would only create a second,
   // contradictory way to decide the same question.
   if (category === "file-read") return false;
+  // Folder access has no category toggle at all, deliberately. It is decided by
+  // one explicit switch (`files.agentAddsFoldersWithoutAsking`) rather than by
+  // a per-mode auto-approve row, so there is no key to look up and nothing here
+  // to add: a map entry would give it a second, per-mode on switch that could
+  // disagree with the single one the user reads in Settings.
+  if (category === "folder-access") return false;
   const key: Record<ToolCategory, keyof typeof autoApprove | ""> = {
     "file-read": "",
     "file-write": "fileWrite",
@@ -236,6 +268,7 @@ function autoApproved(autoApprove: Record<string, boolean>, category: ToolCatego
     browser: "browser",
     network: "network",
     mcp: "mcp",
+    "folder-access": "",
   };
   return autoApprove[key[category]] === true;
 }
@@ -256,18 +289,34 @@ function askFor(
   tool: Tool,
   reason: string,
 ): PermissionOutcome {
-  const suggestion =
-    tool.allowSuggestion?.(request.args as never) ??
-    commandLineFromArgs(request.args) ??
-    urlFromArgs(request.args) ??
-    pathFromArgs(request.args) ??
-    undefined;
+  const suggestion = suggestFor(request, tool);
   return {
     decision: "ask",
     reason,
     rule: "ask",
     ...(suggestion ? { allowSuggestion: suggestion } : {}),
   };
+}
+
+/**
+ * A value for "always allow", or nothing.
+ *
+ * Folder access never gets one. "Always allow" writes an entry into an
+ * allow-list, and the only entry available for a folder is that exact folder --
+ * so a single yes would become a standing rule, and `allowedPaths` is consulted
+ * for *every* later call, which is a considerably larger grant than the prompt
+ * the user actually answered. The tool returning `null` is not enough on its own,
+ * because the fallbacks below would supply the path anyway.
+ */
+function suggestFor(request: PermissionRequest, tool: Tool): string | undefined {
+  if (isFolderAccess(tool.name)) return undefined;
+  return (
+    tool.allowSuggestion?.(request.args as never) ??
+    commandLineFromArgs(request.args) ??
+    urlFromArgs(request.args) ??
+    pathFromArgs(request.args) ??
+    undefined
+  );
 }
 
 /** The full command line, e.g. `sudo rm -rf / --no-preserve-root`. */
@@ -319,11 +368,36 @@ function hostOf(url: string): string | null {
   }
 }
 
+/**
+ * Tools that ask to widen access rather than act within it.
+ *
+ * Matched by name rather than by category because the gate needs to recognize
+ * the tool *before* it has decided anything, and a category alone would also
+ * catch a future tool that merely touches folders it is already inside. The
+ * category on the tool is what the auto-approve list sees; this is what the
+ * containment rule and the prompt wording see.
+ */
+const FOLDER_ACCESS_TOOLS = new Set(["add_folder"]);
+
+function isFolderAccess(toolName: string): boolean {
+  return FOLDER_ACCESS_TOOLS.has(toolName);
+}
+
 function describeCall(name: string, args: Record<string, unknown>): string {
   const command = commandLineFromArgs(args);
   if (command) return `Run \`${command}\``;
   const path = pathFromArgs(args);
-  if (path) return `Access \`${path}\``;
+  if (path) {
+    // Say what approving *does*, not just what will be touched. "Allow the agent
+    // to use this folder from now on, in every conversation" is a decision the
+    // user can make; "Access `/home/me/.ssh`" reads like a single read and is
+    // not one.
+    if (isFolderAccess(name)) {
+      const why = typeof args.reason === "string" && args.reason.trim() ? ` Reason: ${args.reason.trim()}` : "";
+      return `Let the agent use \`${path}\` from now on, in every conversation.${why}`;
+    }
+    return `Access \`${path}\``;
+  }
   const url = urlFromArgs(args);
   if (url) return `Request ${url}`;
   return `Run tool \`${name}\``;

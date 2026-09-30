@@ -28,7 +28,7 @@ import type { Settings } from "../settings/schema.js";
  * open" on its own is a dead end for a model that has no way to open one.
  */
 function requireRoots(context: ToolContext): readonly string[] {
-  const roots = authorizedRoots(context.workspace, context.extraRoots);
+  const roots = authorizedRoots(context.workspace, context.extraRoots());
   if (roots.length === 0) {
     throw new Error(
       "This conversation has no folder open, and no folders have been allowed. " +

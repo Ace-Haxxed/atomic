@@ -71,8 +71,23 @@ export const PERMISSION_LEVEL_DESCRIPTIONS: Readonly<Record<PermissionLevel, str
  * `isReadOnlyTool` in the gate, and labelling them with a write-side category
  * would let a user's "auto-approve network" toggle silently wave through
  * `read_file`, which is a different decision entirely.
+ *
+ * `folder-access` is separate for a sharper version of the same reason. Widening
+ * the set of folders the agent may touch is not an edit to a file, and it must
+ * not be waved through by a toggle the user set for something else -- a user who
+ * auto-approves file writes has agreed to edits inside folders already open, not
+ * to new roots appearing. It gets its own decision, its own switch, and its own
+ * prompt.
  */
-export const TOOL_CATEGORIES = ["file-read", "file-write", "bash", "browser", "network", "mcp"] as const;
+export const TOOL_CATEGORIES = [
+  "file-read",
+  "file-write",
+  "bash",
+  "browser",
+  "network",
+  "mcp",
+  "folder-access",
+] as const;
 export const ToolCategorySchema = z.enum(TOOL_CATEGORIES);
 export type ToolCategory = z.infer<typeof ToolCategorySchema>;
 
@@ -269,19 +284,49 @@ export const SettingsSchema = z.object({
    *
    * The workspace is chosen per conversation and is the only root a path is
    * resolved against by default. This list is how a user widens that once, for
-   * every conversation, without handing the *model* the ability to do it: a path
-   * is authorized if it lands inside any entry here, and the only way an entry
-   * gets added is the user picking a folder in the UI.
+   * every conversation.
    *
-   * That distinction is the whole security model. A model that could name a new
-   * root would be able to read `~/.ssh` or `~/.aws` by asking; a user who adds
-   * `/home/me/Code` has said something specific and is responsible for it.
+   * Two things can add an entry, and the difference between them is the whole
+   * security model:
+   *
+   *   - the user picking a folder in Settings, or
+   *   - the agent asking for one mid-task and the user approving it.
+   *
+   * What the model cannot do is add a root with no human involved, unless the
+   * user has explicitly turned that on below. A model that could name a new root
+   * silently would be able to read `~/.ssh` or `~/.aws` by asking -- or by
+   * reading a file that told it to. The agent requesting access is a proposal,
+   * and the prompt is what makes it one.
    */
   files: z
     .object({
       allowedFolders: z.array(z.string().min(1).max(4096)).default(() => []),
+      /**
+       * Whether the agent may request a folder at all.
+       *
+       * Off means the `add_folder` tool is not offered to the model, so the
+       * capability is absent rather than merely unused. Someone who wants the
+       * agent confined to the folders they opened by hand should not have to
+       * watch for requests they know they will always deny.
+       */
+      agentCanRequestFolders: z.boolean().default(true),
+      /**
+       * Add a requested folder without asking.
+       *
+       * The autonomy switch. With it on, a folder the agent names is authorized
+       * the moment it names it -- there is no prompt to inject around, but there
+       * is also no human in the loop, and a file the agent reads can now widen
+       * its own reach by asking in the model's own voice. Deny-list entries
+       * still refuse it: a path the user has explicitly denied is not
+       * something the agent may talk its way into.
+       */
+      agentAddsFoldersWithoutAsking: z.boolean().default(false),
     })
-    .default(() => ({ allowedFolders: [] })),
+    .default(() => ({
+      allowedFolders: [],
+      agentCanRequestFolders: true,
+      agentAddsFoldersWithoutAsking: false,
+    })),
 
   /** No telemetry, ever, unless the user opts in. */
   telemetryEnabled: z.boolean().default(false),

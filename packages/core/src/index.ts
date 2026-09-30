@@ -99,6 +99,7 @@ export {
   validateSettings,
   type SettingsListener,
 } from "./settings/store.js";
+export { authorizedRoots, hasAllowedFolders, withFolder } from "./settings/roots.js";
 
 // ---- secrets -------------------------------------------------------------
 export {
@@ -408,6 +409,7 @@ export {
   type FileSystemPort,
   type ProcessPort,
   type CheckpointPort,
+  type FolderAccessPort,
   type CheckpointRunInfo,
   type CheckpointFileInfo,
   type FileEntry,
@@ -418,6 +420,7 @@ export {
 } from "./host/ports.js";
 export {
   createCodeTools,
+  createFolderTools,
   createReadTools,
   createWriteTools,
   createShellTool,

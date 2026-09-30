@@ -30,8 +30,13 @@ export interface ToolContext {
    * and only reachable by writing a full path. Anything that assumes a single
    * root -- process execution, git, checkpoints, project memory -- keeps using
    * `workspace` alone and cannot wander into them by accident.
+   *
+   * A function, because the list can grow while a run is in progress: the agent
+   * may ask for a folder and the user may approve it, and the tool called after
+   * that has to see it. A snapshot taken at the start of the run would leave the
+   * agent holding an approval it cannot spend until the next message.
    */
-  readonly extraRoots: readonly string[];
+  readonly extraRoots: () => readonly string[];
   /** Human-readable one-liner for the audit log and the UI card header. */
   readonly describe: (args: Record<string, unknown>) => string;
 }

@@ -29,7 +29,7 @@ import { compactMessages, planCompaction, type CompactionOptions } from "./compa
 import type { TurnCostReview } from "../models/free-policy.js";
 import type { AgentEventBus, AgentEvent } from "./events.js";
 import type { Mode } from "../settings/schema.js";
-import type { ApprovalBroker } from "./approval.js";
+import type { ApprovalBroker, ApprovalDecision } from "./approval.js";
 
 export interface AgentRunDeps {
   readonly provider: Provider;
@@ -119,8 +119,20 @@ export interface AgentRunInput {
   readonly system: string | undefined;
   readonly messages: readonly ModelMessage[];
   readonly workspace: string | null;
-  /** Folders the user authorized outside the workspace. See `ToolContext`. */
-  readonly extraRoots?: readonly string[];
+  /**
+   * Folders the user authorized outside the workspace. See `ToolContext`.
+   *
+   * A function rather than an array, and the reason is `add_folder`: a folder
+   * the agent requests and the user approves partway through this same run has
+   * to be usable by the very next tool call. Captured once at the start of the
+   * run, the new folder would be authorized in the settings and still refused by
+   * the gate until the next message -- so the tool would appear to succeed and
+   * change nothing, which is the most confusing failure available.
+   *
+   * A static list is still accepted so callers that cannot change mid-run do not
+   * have to wrap theirs in a closure.
+   */
+  readonly extraRoots?: readonly string[] | (() => readonly string[]);
   readonly temperature?: number | undefined;
   readonly maxOutputTokens?: number | undefined;
   readonly reasoningEffort?: ReasoningEffort;
@@ -595,7 +607,7 @@ export class AgentLoop {
         tool,
         args: call.args,
         workspace: input.workspace,
-        extraRoots: input.extraRoots ?? [],
+        extraRoots: resolveExtraRoots(input.extraRoots),
         conversationId: input.conversationId,
         runId: input.runId,
       });
@@ -641,8 +653,10 @@ export class AgentLoop {
           summary: outcome.reason,
           ...(outcome.allowSuggestion ? { suggestion: outcome.allowSuggestion } : {}),
         });
-        const decision = input.approve
-          ? await input.approve(call, outcome)
+        const decision: ApprovalDecision = input.approve
+          ? (await input.approve(call, outcome))
+            ? "allow"
+            : "deny"
           : await approval.request({
               runId: input.runId,
               callId: call.id,
@@ -652,7 +666,12 @@ export class AgentLoop {
               ...(outcome.allowSuggestion ? { suggestion: outcome.allowSuggestion } : {}),
               signal: input.signal,
             });
-        allowed = decision === "allow";
+        // "allow-always" is an allow. It was compared against `"allow"` alone for
+        // the whole life of this function, so the Allow always button in the
+        // approval card denied the action it was meant to permit: `allowed` came
+        // out false, the tool was reported as refused, and the user was left
+        // believing the agent had ignored them.
+        allowed = decision !== "deny";
         events.emit({
           type: "tool-approval-resolved",
           runId: input.runId,
@@ -690,7 +709,7 @@ export class AgentLoop {
           mode: input.mode,
           signal: input.signal,
           workspace: input.workspace,
-          extraRoots: input.extraRoots ?? [],
+          extraRoots: () => resolveExtraRoots(input.extraRoots),
           describe: (a) => describeCall({ name: call.name, args: a } as ToolCall),
         });
       } catch (error) {
@@ -822,6 +841,19 @@ function toolMessage(call: ToolCall, content: string, isError: boolean): ModelMe
     toolCallId: call.id,
     toolName: call.name,
   };
+}
+
+/**
+ * Read the authorized folders as they are *now*, not as they were when the run
+ * began. `add_folder` changes this list from inside the loop, and a value read
+ * once at entry would leave the next call in the same run working from a list
+ * that no longer describes what the user approved.
+ */
+function resolveExtraRoots(
+  extraRoots: readonly string[] | (() => readonly string[]) | undefined,
+): readonly string[] {
+  if (typeof extraRoots === "function") return extraRoots();
+  return extraRoots ?? [];
 }
 
 function describeCall(call: ToolCall): string {

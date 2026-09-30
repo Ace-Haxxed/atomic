@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createCodeTools } from "./index.js";
+import { createCodeTools, createFolderTools } from "./index.js";
 import { createWriteTools, contextDiff } from "./write.js";
 import { createReadTools } from "./read.js";
 import { createShellTool } from "./shell.js";
@@ -93,7 +93,7 @@ const context = (workspace: string | null = "/ws", extraRoots: readonly string[]
   mode: "code",
   signal: new AbortController().signal,
   workspace,
-  extraRoots,
+  extraRoots: () => extraRoots,
   describe: (args) => JSON.stringify(args),
 });
 
@@ -740,5 +740,123 @@ describe("checkpoints", () => {
     const { port: fs } = fakeFs({ "a.ts": "original" });
     const result = await run(find(createWriteTools(fs), "write_file"), { path: "a.ts", content: "x" });
     expect(result.isError).toBeFalsy();
+  });
+});
+
+/*
+ * The folder tool, from the model's side.
+ *
+ * What matters here is not that the tool calls the port -- that is a one-line
+ * delegation -- but that it refuses to act on an aborted run, reports what
+ * happened in terms the model can use, and does not exist at all when the host
+ * cannot authorize folders. The last one matters most: a tool offered to a model
+ * that always fails is one the model keeps calling.
+ */
+describe("add_folder", () => {
+  const EXTRA = "/home/me/Code";
+
+  function fakeFolders(
+    result: { ok: true; path: string } | { ok: false; reason: string } = { ok: true, path: EXTRA },
+  ) {
+    const asked: string[] = [];
+    return {
+      asked,
+      port: {
+        async authorize(path: string) {
+          asked.push(path);
+          return result;
+        },
+      },
+    };
+  }
+
+  it("authorizes the folder and says how to use it next", async () => {
+    const { asked, port } = fakeFolders();
+    const result = await run(find(createFolderTools({ folders: port }), "add_folder"), {
+      path: EXTRA,
+    }, context("/ws"));
+    expect(asked).toEqual([EXTRA]);
+    // The follow-up has to be spelled out. "Added" alone leaves the model
+    // guessing whether the folder is relative to the workspace, and it will guess
+    // wrong.
+    expect(result.content).toContain(`${EXTRA}/README.md`);
+    expect(result.content).toMatch(/relative paths still/i);
+  });
+
+  it("carries the reason the model gave into the result", async () => {
+    const { port } = fakeFolders();
+    const result = await run(find(createFolderTools({ folders: port }), "add_folder"), {
+      path: EXTRA,
+      reason: "the project you named",
+    }, context("/ws"));
+    expect(result.content).toContain("the project you named");
+  });
+
+  it("surfaces a refusal as an error the model can act on", async () => {
+    // Not a thrown exception: the agent asked, the answer was no, and it needs to
+    // carry on rather than have the run torn down.
+    const { port } = fakeFolders({ ok: false, reason: "`/home/me/.ssh` is a credentials folder." });
+    const result = await run(find(createFolderTools({ folders: port }), "add_folder"), {
+      path: "/home/me/.ssh",
+    }, context("/ws"));
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("credentials folder");
+  });
+
+  it("does not authorize anything once the run is cancelled", async () => {
+    // The gate has already asked the user by the time a tool runs, so honouring
+    // a cancellation here means refusing to leave behind the one thing the user
+    // was shown and did not get. An aborted run must change nothing.
+    const { asked, port } = fakeFolders();
+    const cancelled = context("/ws");
+    const result = await run(
+      find(createFolderTools({ folders: port }), "add_folder"),
+      { path: EXTRA },
+      { ...cancelled, signal: AbortSignal.abort() },
+    );
+    expect(asked).toEqual([]);
+    expect(result.isError).toBe(true);
+    expect(result.content).toMatch(/cancel/i);
+  });
+
+  it("asks for an absolute path, and says so in the schema", async () => {
+    // A relative path here is ambiguous -- relative to the workspace, which is
+    // already allowed, or to nothing at all. The schema says absolute so the
+    // model does not have to infer it.
+    const tool = find(createFolderTools({ folders: fakeFolders().port }), "add_folder");
+    expect(JSON.stringify(tool.parameters)).toMatch(/absolute/i);
+  });
+
+  it("is absent when the host cannot authorize folders", () => {
+    // The switch-off case. A model told about a capability that is always
+    // refused keeps reaching for it, so absence is the honest answer.
+    const names = createCodeTools({
+      fs: fakeFs().port,
+      process: {} as never,
+      todos: fakeTodos(),
+    }).map((tool) => tool.name);
+    expect(names).not.toContain("add_folder");
+  });
+
+  it("is present when the host can, and declares folder-access as its category", () => {
+    const tool = find(
+      createCodeTools({
+        fs: fakeFs().port,
+        process: {} as never,
+        todos: fakeTodos(),
+        folders: fakeFolders().port,
+      }),
+      "add_folder",
+    );
+    // Not `file-write`: that category is covered by auto-accept, which would
+    // grant this without a prompt on a switch the user set for something else.
+    expect(tool.categories).toEqual(["folder-access"]);
+  });
+
+  it("tells the model not to ask for credentials or system folders", async () => {
+    const tool = find(createFolderTools({ folders: fakeFolders().port }), "add_folder");
+    // The refusal list is enforced in Rust, but a model that knows the rule
+    // wastes far fewer turns discovering it.
+    expect(tool.description).toMatch(/credential|home director/i);
   });
 });
