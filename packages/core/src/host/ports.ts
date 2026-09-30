@@ -58,22 +58,33 @@ export interface RunResult {
   readonly timedOut: boolean;
 }
 
-/** A file system, scoped to one workspace root. */
+/**
+ * A file system, scoped to the folders a conversation is allowed to use.
+ *
+ * Every method takes the *whole* list of authorized roots rather than a single
+ * workspace, because a path is authorized by being inside any one of them. The
+ * list is passed as data so the host can re-check it against the real filesystem
+ * -- nothing on this side of the port gets to decide a path is safe.
+ */
 export interface FileSystemPort {
   /**
+   * @param roots Authorized roots; a path inside any of them is allowed.
    * @param offset 1-based first line to return.
    */
   readFile(
-    workspaceRoot: string,
+    roots: readonly string[],
     path: string,
     options?: { offset?: number; limit?: number },
   ): Promise<ReadFileResult>;
-  writeFile(workspaceRoot: string, path: string, content: string): Promise<FileEntry>;
-  listDirectory(workspaceRoot: string, path: string): Promise<{ entries: readonly FileEntry[]; truncated: boolean }>;
-  /** Workspace-relative paths matching a glob, in the order found. */
-  glob(workspaceRoot: string, pattern: string): Promise<readonly string[]>;
+  writeFile(roots: readonly string[], path: string, content: string): Promise<FileEntry>;
+  listDirectory(
+    roots: readonly string[],
+    path: string,
+  ): Promise<{ entries: readonly FileEntry[]; truncated: boolean }>;
+  /** Paths matching a glob across every authorized root, in the order found. */
+  glob(roots: readonly string[], pattern: string): Promise<readonly string[]>;
   grep(
-    workspaceRoot: string,
+    roots: readonly string[],
     pattern: string,
     options?: { glob?: string; caseSensitive?: boolean; maxMatches?: number },
   ): Promise<GrepResult>;

@@ -21,6 +21,7 @@ import type {
   ProviderModels,
 } from "../models/catalog-service.js";
 import type { OllamaPullProgress } from "../providers/ollama/catalog.js";
+import type { ApiKeySource } from "../secrets/secret-store.js";
 import type { ContentPart, Usage } from "../models/types.js";
 import type { AppDirs, HostEnvironment } from "../platform/dirs.js";
 import type { PlatformInfo } from "../platform/platform.js";
@@ -38,6 +39,15 @@ export interface SendMessageInput {
   readonly attachments?: readonly Attachment[];
   /** Overrides the per-mode model for this turn. */
   readonly model?: string;
+  /**
+   * Names the provider to send this turn to, alongside `model`.
+   *
+   * Only ever set from a user action -- accepting a provider-switch offer, or
+   * picking a model in a provider's own row. A model id is not enough on its
+   * own: `providerForModel` guesses from the catalog, and a guess that picks the
+   * wrong account is the exact mistake this exists to prevent.
+   */
+  readonly providerId?: string;
   /** Regenerating an earlier message. */
   readonly parentId?: string | null;
   /** Per-chat system prompt override. */
@@ -121,8 +131,24 @@ export interface HostApi {
     mode: Mode,
     patch: DeepPartial<Settings["permissions"][Mode]>,
   ): Promise<Settings>;
+  /**
+   * Save a provider's key into the OS credential store.
+   *
+   * Scoped to `providerId` and to nothing else: it does not change which
+   * provider the app is pointed at, and it does not change the selected model.
+   * `null` clears the key. The write is read back, presence only, so a
+   * credential store that accepts a write and cannot return it is reported
+   * instead of shown as "saved".
+   */
   setApiKey(providerId: string, apiKey: string | null): Promise<Settings>;
   hasApiKey(providerId: string): Promise<boolean>;
+  /**
+   * Where each provider's credential comes from, for a per-provider key list.
+   *
+   * Presence only -- never a value. The UI needs to say "in your keychain",
+   * "reached by GEMINI_API_KEY" and "no key yet" as three different facts.
+   */
+  apiKeySources(): Promise<Readonly<Record<string, ApiKeySource>>>;
   testConnection(providerId: string): Promise<TestConnectionResult>;
 
   // ---- models ----------------------------------------------------------
@@ -255,6 +281,24 @@ export interface HostApi {
    */
   continueMessage(input: {
     readonly conversationId: string;
+  }): Promise<{ readonly runId: string }>;
+  /**
+   * Answer a question that was already asked, on a provider the user picked.
+   *
+   * Separate from `sendMessage` for the same reason `continueMessage` is, and
+   * it is the same reason twice here. The turn that triggered the provider
+   * switch *was* persisted before the run, so accepting an offer and re-sending
+   * the text appends the user's own message a second time -- the transcript
+   * ends up holding the same question twice with one answer under it, and the
+   * model reads the duplicate as emphasis at best.
+   *
+   * No fallbacks are attached: the user chose this provider, so if it also fails
+   * the run ends and offers again rather than quietly going somewhere else.
+   */
+  retryOnProvider(input: {
+    readonly conversationId: string;
+    readonly model: string;
+    readonly providerId: string;
   }): Promise<{ readonly runId: string }>;
   /** Stream of agent events. Ends when the run finishes or errors. */
   streamEvents(): AsyncIterable<AgentEvent>;

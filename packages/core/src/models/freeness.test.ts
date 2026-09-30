@@ -98,6 +98,55 @@ describe("freeness: local and free-tier providers", () => {
   });
 });
 
+/**
+ * The badge is a claim about one model, so the account-level tier is not enough
+ * evidence to support it. It used to be: every Google, Groq and Mistral model in
+ * the catalog was badged "free tier" whether or not that model had a price, so
+ * a model published at $15 per million carried the same badge as one the vendor
+ * gives away.
+ */
+describe("freeness: a free tier is not a per-model price", () => {
+  const tiered = [
+    ["google", "gemini-pro"],
+    ["groq", "llama-3.3-70b"],
+    ["mistral", "large-latest"],
+  ] as const;
+
+  for (const [providerId, modelId] of tiered) {
+    const provider = providerById(providerId)!;
+
+    it(`keeps ${providerId} off the free-tier badge when the model has a price`, () => {
+      const detail = freenessFor(provider, model(modelId, { input: 15, output: 75 }));
+      expect(detail.freeness).toBe("paid");
+    });
+
+    it(`calls a ${providerId} model published at $0 free, not free-tier`, () => {
+      expect(freenessFor(provider, model(modelId, ZERO_COST_FIXTURE)).freeness).toBe("free");
+    });
+
+    it(`still reports the tier as context on a priced ${providerId} model`, () => {
+      // The tier is real and worth saying; what it is not allowed to do is
+      // override the price.
+      const detail = freenessFor(provider, model(modelId, { input: 15, output: 75 }));
+      expect(detail.reason).toContain("free tier");
+      expect(detail.reason).toContain("15");
+    });
+
+    it(`uses the tier for an unpriced ${providerId} model`, () => {
+      expect(freenessFor(provider, model(modelId, undefined)).freeness).toBe("free-tier");
+    });
+  }
+
+  it("does not let a free tier satisfy a free-only guarantee", () => {
+    // Unchanged by the above, and the reason the distinction matters: even a
+    // legitimately free-tiered model is not something to auto-select.
+    const provider = providerById("google")!;
+    const detail = freenessFor(provider, model("gemini-flash", undefined));
+    expect(detail.freeness).toBe("free-tier");
+    expect(isFreeEnough(detail.freeness, true)).toBe(false);
+  });
+});
+
 describe("isFreeEnough", () => {
   it("allows free models under a free-only policy", () => {
     expect(isFreeEnough("free", true)).toBe(true);

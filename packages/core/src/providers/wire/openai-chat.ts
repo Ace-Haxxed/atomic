@@ -400,6 +400,12 @@ export function mapChatUsage(usage: ChatUsage | undefined): Usage {
     cacheReadTokens: cached || undefined,
     totalTokens: usage.total_tokens ?? input + output,
     ...(reasoning ? { reasoningTokens: reasoning } : {}),
+    // The one number here that is a bill rather than an estimate. Present on
+    // OpenRouter and OpenCode Zen responses; absent on most, which is why it is
+    // optional and why nothing can assume it exists.
+    ...(typeof usage.cost === "number" && Number.isFinite(usage.cost)
+      ? { reportedCost: usage.cost }
+      : {}),
   };
 }
 
@@ -426,6 +432,8 @@ interface ChatUsage {
   total_tokens?: number;
   prompt_tokens_details?: { cached_tokens?: number };
   completion_tokens_details?: { reasoning_tokens?: number };
+  /** USD charged for this turn, where the provider reports it. */
+  cost?: number;
 }
 
 interface ChatChunk {

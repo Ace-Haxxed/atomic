@@ -32,6 +32,7 @@ import {
   OLLAMA_DEFAULT_ROOT,
   OLLAMA_PROVIDER_ID as OLLAMA_ID,
   formatBytes,
+  OllamaUrlError,
   ollamaRootFrom,
   parsePullLine,
   parseShow,
@@ -84,7 +85,25 @@ export class OllamaProvider implements Provider {
 
   constructor(credentials: Partial<ProviderCredentials> = {}, deps: OllamaProviderDeps = {}) {
     const configured = credentials.baseUrl?.trim() || OLLAMA_DEFAULT_ROOT;
-    this.root = ollamaRootFrom(configured);
+    /*
+     * A bad address is a configuration error, so it is raised as one. Left as a
+     * raw parse failure it reached the user through whichever generic path
+     * happened to catch it, which is how a typo in one Settings field became
+     * "Ollama isn't running" -- advice about the one thing that was not wrong.
+     */
+    try {
+      this.root = ollamaRootFrom(configured);
+    } catch (error) {
+      if (error instanceof OllamaUrlError) {
+        throw new ProviderError(
+          ProviderErrorKind.config,
+          "ollama_bad_url",
+          error.message,
+          { cause: error, userMessage: error.message },
+        );
+      }
+      throw error;
+    }
     this.baseUrl = `${this.root}/v1`;
     this.#db = deps.db;
     this.#now = deps.now ?? (() => Date.now());

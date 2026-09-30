@@ -34,6 +34,16 @@ export interface PermissionRequest {
   readonly args: Record<string, unknown>;
   /** Absolute workspace root, or null when the mode is unconstrained. */
   readonly workspace: string | null;
+  /**
+   * Folders the user authorized in Settings, outside the workspace.
+   *
+   * Needed here for the same reason the host needs them: containment is enforced
+   * twice, in this gate and again in the Rust resolver, and a path allowed by
+   * only one of the two is still refused. Without this, authorizing a folder
+   * would change nothing and the refusal would arrive with a reason -- "outside
+   * the workspace" -- that points at the wrong layer.
+   */
+  readonly extraRoots?: readonly string[];
   readonly conversationId: string;
   readonly runId: string;
 }
@@ -133,13 +143,26 @@ export class PermissionGate {
       }
     }
 
-    // 3. Workspace containment. Scoped modes must not escape the chosen folder.
-    if (request.workspace && path) {
-      if (resolvedPath && !isPathInside(resolvedPath, request.workspace, this.#platform)) {
-        return deny(
-          "outside_workspace",
-          `"${resolvedPath}" is outside the workspace folder ${request.workspace}.`,
-        );
+    // 3. Containment. Scoped modes must not escape the chosen folder -- or any
+    //    folder the user added to it deliberately. A path is authorized when it
+    //    is inside the workspace *or* inside one of the extra roots; a path
+    //    inside neither is refused here and again by the host, and the reason
+    //    says which folders were actually open so the user can be told what to
+    //    add rather than left guessing.
+    if (path && resolvedPath) {
+      const roots = [request.workspace, ...(request.extraRoots ?? [])].filter(
+        (root): root is string => typeof root === "string" && root.length > 0,
+      );
+      if (roots.length > 0) {
+        const inside = roots.some((root) => isPathInside(resolvedPath, root, this.#platform));
+        if (!inside) {
+          const open = roots.map((root) => `"${root}"`).join(", ");
+          return deny(
+            "outside_workspace",
+            `"${resolvedPath}" is outside every folder this conversation may use (${open}). ` +
+              `To use another folder, add it under Settings > Files.`,
+          );
+        }
       }
     }
 

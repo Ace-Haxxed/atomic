@@ -39,7 +39,8 @@ import {
   keychain,
   platformInfo,
   memoryDatabase,
-  providerKeys,
+  envProviderKey,
+  envProviderKeyPresence,
   readClipboardImage,
 } from "./host.js";
 import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
@@ -65,6 +66,23 @@ class KeychainSecretStore implements SecretStore {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * Environment credentials, read one at a time.
+   *
+   * These two exist so the whole environment does not have to be handed over
+   * once at startup. Presence answers the "is this provider configured" question
+   * with a boolean; the value is fetched only while constructing the one
+   * provider that needs it, and is not cached anywhere.
+   */
+  async hasEnv(name: string): Promise<boolean> {
+    const presence = await envProviderKeyPresence().catch(() => ({}) as Record<string, boolean>);
+    return presence[name] === true;
+  }
+
+  async readEnv(name: string): Promise<string | null> {
+    return envProviderKey(name).catch(() => null);
   }
 }
 
@@ -101,11 +119,10 @@ export function bootstrap(): Promise<Bootstrap> {
 }
 
 async function start(): Promise<Bootstrap> {
-  const [platform, resolved, version, envKeys] = await Promise.all([
+  const [platform, resolved, version] = await Promise.all([
     platformInfo(),
     appDirs(),
     appVersion(),
-    providerKeys().catch(() => ({} as Record<string, string>)),
   ]);
   // Throws if a path repeats the app directory, which is the mistake that made
   // the app fail to start with SQLITE_CANTOPEN.
@@ -153,7 +170,10 @@ async function start(): Promise<Bootstrap> {
     platform,
     shell,
     dirs,
-    env: envKeys,
+    // Deliberately empty. Environment credentials are reached through
+    // `KeychainSecretStore.hasEnv`/`readEnv`, one provider at a time, so no
+    // long-lived map of credentials exists in the webview.
+    env: {},
     version,
     hostName: "tauri",
     pickFolder: (title) => call<string | null>("pick_folder", { title }),
@@ -165,18 +185,20 @@ async function start(): Promise<Bootstrap> {
     },
     revealPath: (path) => call("reveal_path", { path }),
     readProjectMemory: (workspace) => call<string | null>("read_project_memory", { workspace }),
-    // Code-mode ports. Every path here is workspace-relative and is re-checked
-    // against the canonicalized root on the Rust side; nothing in TypeScript
-    // gets to decide whether a path is safe.
+    // Code-mode ports. Every path here is re-checked against the canonicalized
+    // roots on the Rust side; nothing in TypeScript gets to decide whether a
+    // path is safe. The whole list travels rather than a single workspace
+    // because a path is authorized by landing inside *any* of them -- the open
+    // workspace first, then the folders the user added under Settings.
     fs: {
-      readFile: (root, path, options) =>
-        call("fs_read", { workspaceRoot: root, path, ...(options ?? {}) }),
-      writeFile: (root, path, content) =>
-        call("fs_write", { workspaceRoot: root, path, content }),
-      listDirectory: (root, path) => call("fs_list", { workspaceRoot: root, path }),
-      glob: (root, pattern) => call("fs_glob", { workspaceRoot: root, pattern }),
-      grep: (root, pattern, options) =>
-        call("fs_grep", { workspaceRoot: root, pattern, ...(options ?? {}) }),
+      readFile: (roots, path, options) =>
+        call("fs_read", { workspaceRoots: [...roots], path, ...(options ?? {}) }),
+      writeFile: (roots, path, content) =>
+        call("fs_write", { workspaceRoots: [...roots], path, content }),
+      listDirectory: (roots, path) => call("fs_list", { workspaceRoots: [...roots], path }),
+      glob: (roots, pattern) => call("fs_glob", { workspaceRoots: [...roots], pattern }),
+      grep: (roots, pattern, options) =>
+        call("fs_grep", { workspaceRoots: [...roots], pattern, ...(options ?? {}) }),
     },
     process: {
       run: (root, command, options) =>

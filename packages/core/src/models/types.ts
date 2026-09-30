@@ -73,6 +73,17 @@ export interface Usage {
   readonly cacheWriteTokens?: number;
   readonly reasoningTokens?: number;
   readonly totalTokens: number;
+  /**
+   * What the provider says this turn cost, in USD.
+   *
+   * Distinct from every price in the catalog, and stronger than all of them: it
+   * is the bill for this turn rather than a published rate multiplied by token
+   * counts. Providers that return it (OpenRouter and OpenCode Zen both echo
+   * `usage.cost`) are the only ones that can be *observed* rather than
+   * estimated, and the post-turn guard is built on that difference -- so it
+   * matters that the value is carried rather than discarded on the way through.
+   */
+  readonly reportedCost?: number;
 }
 
 export const EMPTY_USAGE: Usage = Object.freeze({
@@ -89,6 +100,20 @@ export function addUsage(a: Usage, b: Usage): Usage {
     cacheWriteTokens: (a.cacheWriteTokens ?? 0) + (b.cacheWriteTokens ?? 0),
     reasoningTokens: (a.reasoningTokens ?? 0) + (b.reasoningTokens ?? 0),
     totalTokens: a.totalTokens + b.totalTokens,
+    /*
+     * Money adds up, and the sum is the honest number: the guard is asked what
+     * this turn cost, and dropping either side would understate a run that took
+     * several steps.
+     *
+     * It was dropped entirely before, because the field did not exist. The
+     * consequence was that a reported charge was quietly lost at the first
+     * compaction or tool call, so the post-turn guard saw no cost on exactly
+     * the longer runs where the answer mattered most -- and the check passed
+     * against a guard that could not have fired.
+     */
+    ...(a.reportedCost !== undefined || b.reportedCost !== undefined
+      ? { reportedCost: (a.reportedCost ?? 0) + (b.reportedCost ?? 0) }
+      : {}),
   };
 }
 

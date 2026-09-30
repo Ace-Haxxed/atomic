@@ -41,6 +41,18 @@ export interface ProviderErrorDetails {
   readonly attempt?: number;
   readonly body?: string;
   readonly cause?: unknown;
+  /**
+   * Guidance to show instead of the wording for this `kind`.
+   *
+   * The `kind` decides the *category* -- a refusal, a network failure, a
+   * misconfiguration -- and the generic wording for a category is often wrong
+   * for a particular provider. `config` is the clear case: it reads "add your
+   * API key", which is nonsense for Ollama, where no key exists and the address
+   * is the thing to fix. Matching on the message text inside `userMessage` also
+   * works and is what the Zen and Google branches above do, but it couples the
+   * copy to a string a provider might reword.
+   */
+  readonly userMessage?: string;
 }
 
 export class ProviderError extends Error {
@@ -50,6 +62,8 @@ export class ProviderError extends Error {
   readonly retryAfterMs?: number;
   readonly attempt?: number;
   readonly body?: string;
+  /** Overrides the `userMessage` wording for this kind. See the details field. */
+  readonly #userMessage: string | undefined;
 
   constructor(
     kind: ProviderErrorKind,
@@ -69,6 +83,7 @@ export class ProviderError extends Error {
       this.retryAfterMs = details.retryAfterMs;
     if (details.attempt !== undefined) this.attempt = details.attempt;
     if (details.body !== undefined) this.body = details.body;
+    if (details.userMessage !== undefined) this.#userMessage = details.userMessage;
   }
 
   /** True when another attempt could plausibly succeed. */
@@ -83,6 +98,7 @@ export class ProviderError extends Error {
 
   /** Short, non-technical guidance for the user. */
   get userMessage(): string {
+    if (this.#userMessage !== undefined) return this.#userMessage;
     switch (this.kind) {
       case "auth":
         return "Your API key was rejected. Check it in Settings → Models.";
@@ -99,6 +115,14 @@ export class ProviderError extends Error {
           /free tier can only be used from within OpenCode/i.test(this.message)
         ) {
           return "OpenCode reserves this free model for its own app. Atomic cannot use it -- pick one of the other free models.";
+        }
+        // Google's 403 is the same status with a different cause: the key is
+        // valid and the Generative Language API is simply not enabled for the
+        // project. That is fixed in Google Cloud, never by re-pasting the key, so
+        // both the Zen wording and the "check your key" wording send the user
+        // somewhere that cannot help.
+        if (/generativelanguage|not enabled for this project/i.test(this.message)) {
+          return "Google rejected the request because the Generative Language API is not enabled for this project. Enable it in Google AI Studio, then refresh. Your key itself is fine.";
         }
         return "This key is not allowed to use that model. Pick another model, or ask an OpenCode Zen workspace admin to enable it.";
       case "rate-limit":

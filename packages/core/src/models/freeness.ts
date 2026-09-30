@@ -199,6 +199,38 @@ function freeTierFreeness(
   };
 }
 
+/**
+ * A free tier, applied only to a model the tier actually covers.
+ *
+ * The account-level tier is real but it is not a property of a model, and the
+ * previous version applied it to every model the provider listed. That produced
+ * a "free tier" badge on models with a published price of $15 per million, which
+ * is the exact overclaim this avoids: the badge reads as a statement about the
+ * model, and on some of them it is false.
+ *
+ * So a published per-model price wins. $0/$0 is free outright; any other price
+ * means this model is billed, and the tier is not extended to cover it. Only when
+ * the provider has said nothing about this specific model -- no price either way
+ * -- is the account tier the best available evidence, and then the reason says
+ * so, because "your account might be in the free tier" is not the same claim as
+ * "this model is free".
+ */
+function tieredFreeness(
+  providerLabel: string,
+  model: ModelInfo,
+  limitNote: string,
+): FreenessDetail {
+  if (knownCost(model)) {
+    const priced = costFreeness(model, providerLabel);
+    return {
+      ...priced,
+      // The price is the finding; the tier is context for it.
+      reason: `${priced.reason} ${providerLabel} also offers a free tier (${limitNote}), which this price does not appear to cover.`,
+    };
+  }
+  return freeTierFreeness(providerLabel, limitNote);
+}
+
 function paidFreeness(providerLabel: string): FreenessDetail {
   return {
     freeness: "paid",
@@ -267,11 +299,11 @@ export function freenessFor(
     case "ollama":
       return localFreeness(provider.label);
     case "google":
-      return freeTierFreeness(provider.label, "free tier subject to quotas");
+      return tieredFreeness(provider.label, model, "free tier subject to quotas");
     case "groq":
-      return freeTierFreeness(provider.label, "developer free tier");
+      return tieredFreeness(provider.label, model, "developer free tier");
     case "mistral":
-      return freeTierFreeness(provider.label, "experimental free tier");
+      return tieredFreeness(provider.label, model, "experimental free tier");
     case "anthropic":
     case "openai":
     case "deepseek":

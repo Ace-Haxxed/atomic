@@ -361,6 +361,78 @@ describe("a model switch", () => {
  * stops early. Without this the reply looks finished and the only way to get the
  * rest is to rephrase the question from scratch.
  */
+describe("a provider switch offer", () => {
+  const offer: AgentEvent = {
+    type: "provider-switch-required",
+    runId: "run-1",
+    from: "claude-sonnet",
+    to: "gpt-4o",
+    providerId: "openrouter",
+    providerLabel: "OpenRouter",
+    reason: "it hit a rate limit",
+  };
+
+  it("names the model, the account, and why", () => {
+    const state = apply(IDLE, runStart, offer);
+    expect(state.providerOffer).toEqual({
+      model: "gpt-4o",
+      providerId: "openrouter",
+      providerLabel: "OpenRouter",
+      reason: "it hit a rate limit",
+    });
+  });
+
+  /**
+   * The offer is how the user finds out which account holds their conversation.
+   * As an error it read as a crash with a cause they could not act on.
+   */
+  it("is a question, not an error", () => {
+    const state = apply(IDLE, runStart, offer);
+    expect(state.error).toBeNull();
+    expect(state.status).not.toBe("error");
+  });
+
+  it("does not survive the next run", () => {
+    const state = apply(IDLE, runStart, offer, {
+      type: "run-start",
+      runId: "run-2",
+      conversationId: "conv-1",
+      mode: "code",
+      model: "claude-sonnet",
+    });
+    expect(state.providerOffer).toBeNull();
+  });
+
+  it("ignores an offer from a run that is no longer on screen", () => {
+    const state = apply(IDLE, runStart, { ...offer, runId: "run-0" });
+    expect(state.providerOffer).toBeNull();
+  });
+});
+
+describe("a cost note", () => {
+  /**
+   * The note and the switch both want to be the one line above the transcript.
+   * One slot for each meant whichever arrived second erased the first, so a
+   * switch stopped being reported the moment a note became possible.
+   */
+  it("keeps the first note only, and does not error", () => {
+    const state = apply(IDLE, runStart, {
+      type: "run-note",
+      runId: "run-1",
+      message: "qwen3 does not publish a per-token price.",
+    });
+    expect(state.note).toBe("qwen3 does not publish a per-token price.");
+    expect(state.error).toBeNull();
+
+    const second = apply(state, {
+      type: "run-note",
+      runId: "run-1",
+      message: "The same sentence again.",
+    });
+    expect(second.note).toBe("qwen3 does not publish a per-token price.");
+  });
+});
+
 describe("a truncated turn", () => {
   const truncatedRun = reduce(
     reduce(IDLE, {

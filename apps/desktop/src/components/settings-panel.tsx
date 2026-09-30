@@ -1,8 +1,9 @@
 /**
  * Settings.
  *
- * Four sections, in the order a user actually needs them: connect a provider,
- * pick a model, set how much the agent may do, then the app's own behaviour.
+ * Five sections, in the order a user actually needs them: connect a provider,
+ * pick a model, set how much the agent may do, say which folders the agent may
+ * touch, then the app's own behaviour.
  *
  * Two rules hold everywhere in this file:
  *  - an API key is written straight to the keychain and never enters state, so
@@ -131,34 +132,35 @@ export function SettingsPanel(props: SettingsPanelProps) {
   const detected = useMemo(() => detectProviderFromKey(apiKey), [apiKey]);
 
   /**
-   * Save the key under the provider its shape implies.
+   * Save the key under the provider this form is showing.
    *
-   * A `certain` match switches the whole app over, because leaving the app
-   * pointed at the wrong provider while holding the right key produces a 401
-   * that looks like a bad key. A `likely` match only offers the switch: many
-   * vendors copied `sk-`, and quietly rerouting someone's key to a vendor they
-   * did not choose is not a decision this app should make.
+   * The provider is taken from the form and never from the key's shape. Detection
+   * used to re-point the whole app -- `settings.providerId` -- at the provider it
+   * recognised, on the theory that holding the right key under the wrong provider
+   * is a confusing state. It is a much worse one: saving a key silently moved the
+   * active provider out from under the current chat and the model selection, and
+   * the only way to store a second provider's key was to switch the app to that
+   * provider first, so the app looked like it could hold one or two keys at most.
+   *
+   * A mismatching key is now a note under the field with a one-click "save it to
+   * <provider>" that targets that provider's own slot, and nothing else changes.
    */
   const saveKey = async () => {
     // Clear the previous failure up front, so a successful save does not leave
     // the old error sitting next to the fresh "key saved" badge.
     setSaveError(null);
     setKeyState("saving");
-    const target =
-      isConfident(detected) && detected.providerId
-        ? detected.providerId
-        : settings.providerId;
+    const target = settings.providerId;
     try {
-      if (target !== settings.providerId) {
-        const next = await patch({ providerId: target });
-        if (!next) return;
-        setSettings(next);
-      }
       await props.api.setApiKey(target, apiKey.trim() || null);
       // Cleared immediately: the value now lives in the OS keychain, and leaving
       // it in a React state field is a liability with no benefit.
       setApiKey("");
-      setHasKey(apiKey.trim().length > 0);
+      // Presence is re-read from the credential store rather than assumed from
+      // the length of what was typed, so an unconfirmed write is not shown as a
+      // success. `setApiKey` already throws in that case; this is the belt to
+      // that braces, and it keeps the badge honest across a restart.
+      setHasKey(await props.api.hasApiKey(target));
       setKeyState("saved");
       // A new key can change what the provider will answer, and the catalog is
       // cached, so refresh rather than leaving a stale list on screen.
@@ -169,7 +171,14 @@ export function SettingsPanel(props: SettingsPanelProps) {
     }
   };
 
-  /** Adopt the detected provider without saving the key yet. */
+  /**
+   * Point the app at the detected provider.
+   *
+   * This changes the app's selected provider, which is what the Provider select
+   * above already does -- so it is an explicit click on a labelled control, not
+   * something a save does behind the user's back. The key itself is still saved
+   * to whichever provider this form is showing.
+   */
   const useDetectedProvider = async () => {
     if (!detected.providerId) return;
     const next = await patch({ providerId: detected.providerId });
@@ -348,7 +357,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
                     {detected.providerId === settings.providerId ? (
                       <span className="text-content-subtle">
                         {" "}
-                        — already selected
+                        — this is the selected provider
                       </span>
                     ) : (
                       <button
@@ -356,7 +365,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
                         className="ml-1 underline underline-offset-2"
                         onClick={() => void useDetectedProvider()}
                       >
-                        use {detected.label}
+                        select {detected.label} as the provider
                       </button>
                     )}
                   </>
@@ -552,6 +561,8 @@ export function SettingsPanel(props: SettingsPanelProps) {
             />
           </CardBody>
         </Card>
+
+        <FilesCard api={props.api} settings={settings} onPatch={patch} />
 
         <Card>
           <CardHeader>
@@ -1163,5 +1174,95 @@ function providerLabel(providerId: string): string {
   return (
     PROVIDERS.find((provider) => provider.id === providerId)?.label ??
     providerId
+  );
+}
+
+/**
+ * Folders the agent may use besides the open workspace.
+ *
+ * The wording here is the load-bearing part. This is a grant of file access, and
+ * the only thing standing between "add a folder" and "read my SSH keys" is that
+ * the user picks the folder -- the model can name a path all it likes, but it
+ * cannot add a root, and a path outside every folder here is refused. So the
+ * list says what it is, and says that the model picks nothing.
+ */
+function FilesCard({
+  api,
+  settings,
+  onPatch,
+}: {
+  readonly api: HostApi;
+  readonly settings: Settings;
+  readonly onPatch: (update: Parameters<HostApi["updateSettings"]>[0]) => Promise<Settings | null>;
+}) {
+  const folders = settings.files?.allowedFolders ?? [];
+  // A folder can arrive twice -- pasted by hand, or picked again after being
+  // removed elsewhere. Adding it a second time would be a no-op that looks like a
+  // success, so it is refused here with a reason rather than silently accepted.
+  const [error, setError] = useState<string | null>(null);
+
+  const add = async () => {
+    setError(null);
+    const picked = await api.pickFolder("Choose a folder the agent may use");
+    if (!picked) return;
+    if (folders.some((folder) => folder.replace(/[/\\]+$/, "") === picked.replace(/[/\\]+$/, ""))) {
+      setError(`${picked} is already on the list.`);
+      return;
+    }
+    await onPatch({ files: { allowedFolders: [...folders, picked] } });
+  };
+
+  const remove = async (folder: string) => {
+    setError(null);
+    await onPatch({ files: { allowedFolders: folders.filter((entry) => entry !== folder) } });
+  };
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Files</CardTitle>
+      </CardHeader>
+      <CardBody className="space-y-2">
+        <p className="text-[11px] text-content-muted">
+          The agent can read and write inside the folder you open for a chat. Add
+          folders here to let it work in those too -- it can use a folder you have
+          listed, but it cannot add one itself.
+        </p>
+        {folders.length === 0 ? (
+          <p className="text-[11px] text-content-muted">
+            No extra folders. Only the folder a chat has open is usable.
+          </p>
+        ) : (
+          <ul className="space-y-1">
+            {folders.map((folder) => (
+              <li
+                key={folder}
+                className="flex items-center gap-2 rounded-md border border-border-base px-2 py-1"
+              >
+                <span className="min-w-0 flex-1 truncate text-[11px]" title={folder}>
+                  {folder}
+                </span>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  aria-label={`Stop using ${folder}`}
+                  onClick={() => void remove(folder)}
+                >
+                  Remove
+                </Button>
+              </li>
+            ))}
+          </ul>
+        )}
+        {error ? (
+          <p role="alert" className="text-[11px] text-danger">
+            {error}
+          </p>
+        ) : null}
+        <Button size="sm" variant="ghost" onClick={() => void add()}>
+          Add folder
+        </Button>
+      </CardBody>
+    </Card>
   );
 }

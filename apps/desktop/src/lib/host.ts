@@ -116,14 +116,28 @@ function isAbsolute(path: string): boolean {
 }
 
 /**
- * Provider API keys the native side is willing to expose.
+ * Which provider keys exist in the environment, as booleans.
  *
- * The Rust side returns an allowlist, never a dump of the process environment:
- * `HostServices.env` is indexed by a user-editable setting, so handing over every
- * variable would make "read my model key" into "exfiltrate every secret".
+ * Presence only. This used to return a `Record<string, string>` of every
+ * provider key's *value* into the webview at startup, which meant any renderer
+ * bug, any error-logging stack, and any future devtools session held eleven live
+ * credentials at once -- contradicting the rule in `secrets.rs` that a key never
+ * crosses into the webview except to become an `Authorization` header.
+ *
+ * `envProviderKey` below is the replacement for the one case that genuinely
+ * needs a value: building a single provider, at the moment it is needed.
  */
-export const providerKeys = (): Promise<Record<string, string>> =>
-  call<Record<string, string>>("env_provider_keys");
+export const envProviderKeyPresence = (): Promise<Record<string, boolean>> =>
+  call<Record<string, boolean>>("env_provider_key_presence");
+
+/**
+ * One provider key, fetched on demand.
+ *
+ * Rust refuses any name outside its own allowlist, so this cannot be used to
+ * read an arbitrary variable even though `apiKeyEnvVar` is user-editable.
+ */
+export const envProviderKey = async (name: string): Promise<string | null> =>
+  (await call<string | null>("env_provider_key_read", { name })) ?? null;
 
 /** Wrap pasted clipboard bytes for the Rust attachment reader. */
 export const attachments = {

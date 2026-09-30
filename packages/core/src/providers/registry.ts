@@ -32,9 +32,23 @@ export interface ProviderDefinition {
    * without asking. See `detect-key.ts`.
    */
   readonly selfIdentifying: boolean;
+  /**
+   * How this provider's model list is fetched, when `<baseUrl>/models` is wrong.
+   *
+   * Gemini is the case that matters: its OpenAI-compatibility surface serves chat
+   * completions but has no `/models` endpoint at all (verified live: the compat
+   * path 404s, the native path 403s for want of a key), so the shared
+   * implementation's `${baseUrl}/models` can only ever fail. `native-gemini`
+   * reads the list from Google's own endpoint while chat stays on the compat
+   * path. `null` means the default.
+   */
+  readonly catalogSource?: CatalogSource | null;
   /** One line for the settings UI. */
   readonly note: string;
 }
+
+/** How a provider's model list is fetched. */
+export type CatalogSource = "native-gemini";
 
 function openaiCompatible(
   id: string,
@@ -44,6 +58,7 @@ function openaiCompatible(
   selfIdentifying: boolean,
   note: string,
   defaultWireFormat: WireFormat = "openai-chat",
+  catalogSource: CatalogSource | null = null,
 ): ProviderDefinition {
   return {
     id,
@@ -53,6 +68,7 @@ function openaiCompatible(
     dialect: "openai",
     defaultWireFormat,
     selfIdentifying,
+    ...(catalogSource ? { catalogSource } : {}),
     note,
   };
 }
@@ -123,12 +139,15 @@ export const PROVIDERS: readonly ProviderDefinition[] = [
   {
     id: "google",
     label: "Google Gemini",
-    // Google's OpenAI-compatible surface, so one code path covers it.
+    // Google's OpenAI-compatible surface, so one code path covers it. Chat and
+    // embeddings live here; the model list does not, so `catalogSource` sends the
+    // listing to the native endpoint instead of a URL that always 404s.
     baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
     envVar: "GEMINI_API_KEY",
     dialect: "openai",
     defaultWireFormat: "openai-chat",
     selfIdentifying: true,
+    catalogSource: "native-gemini",
     note: "Gemini models.",
   },
   {

@@ -208,6 +208,43 @@ describe("search and filters", () => {
     expect(ids).not.toContain("unpriced-model");
   });
 
+  /**
+   * The freeness chips.
+   *
+   * The header picker and the models tab used to carry separate copies of this
+   * filter, and only the settings copy honoured `freeness` -- so ticking Paid
+   * narrowed the list in one place and did nothing in the other, which reads as
+   * a broken chip rather than as two filters disagreeing. The behaviour is
+   * pinned here on the shared implementation both surfaces now call.
+   */
+  it("narrows to the chosen freeness groups", () => {
+    const paid = filterModels(ALL, { freeness: ["paid"] }).map((m) => m.id);
+    expect(paid).toEqual(["paid-model"]);
+
+    const unknown = filterModels(ALL, { freeness: ["unknown"] }).map((m) => m.id);
+    expect(unknown).toEqual(["unpriced-model"]);
+
+    const freeish = filterModels(ALL, { freeness: ["free", "free-tier"] }).map((m) => m.id);
+    expect(freeish).toEqual(["some-model:free", "tooling-model", "local-coder:8b"]);
+  });
+
+  it("shows everything when no group is chosen", () => {
+    // The chips clear to "no choice". Reading that as an empty intersection
+    // emptied the whole catalog, so the unselected state has to mean "no
+    // narrowing" rather than "nothing matches".
+    expect(filterModels(ALL, { freeness: [] })).toHaveLength(ALL.length);
+    expect(filterModels(ALL, { freeness: undefined })).toHaveLength(ALL.length);
+  });
+
+  it("combines the group chips with the other filters", () => {
+    expect(filterModels(ALL, { freeness: ["free"], localOnly: true }).map((m) => m.id)).toEqual([
+      "local-coder:8b",
+    ]);
+    // Groups and free-only are the intersection when both are present, so a
+    // contradictory pair honestly shows nothing rather than quietly widening.
+    expect(filterModels(ALL, { freeness: ["paid"], freeOnly: true })).toEqual([]);
+  });
+
   it("keeps only tool-capable models under the tools filter", () => {
     expect(filterModels(ALL, { toolsOnly: true }).map((m) => m.id)).toEqual(["tooling-model"]);
   });

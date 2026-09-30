@@ -25,12 +25,16 @@ export interface MessageListProps {
   readonly error: string | null;
   readonly usage: Usage;
   /**
-   * A non-fatal line above the transcript, for something the user should see
-   * but that did not stop the run -- a model or provider switch, a notice about
-   * a missing selection. Separate from `error` because an error ends the turn
-   * and this does not.
+   * Non-fatal lines above the transcript, for things the user should see that did
+   * not stop the run -- a model or provider switch, a note about an unpriced free
+   * model. Separate from `error` because an error ends the turn and these do not.
+   *
+   * A list rather than one string because a run can do both: a rate limit can
+   * move the model to another provider *and* that model can publish no price.
+   * The old single slot kept whichever came last and dropped the other, which
+   * is how a switch notice stopped appearing the moment a note could.
    */
-  readonly notice?: string | null;
+  readonly notices?: readonly string[];
   readonly onRetry?: () => void;
   /**
    * True when the answer was cut off at the output-token limit, and the handler
@@ -91,14 +95,15 @@ export function MessageList(props: MessageListProps) {
   return (
     <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto">
       <div className="mx-auto flex w-full max-w-3xl flex-col gap-4 px-4 py-6">
-        {props.notice ? (
+        {props.notices?.map((notice) => (
           <p
+            key={notice}
             role="status"
             className="rounded-md border border-border bg-surface-2 px-3 py-2 text-[11px] text-content-muted"
           >
-            {props.notice}
+            {notice}
           </p>
-        ) : null}
+        ))}
 
         {props.messages.length === 0 && !hasLiveContent ? (
           <Welcome />

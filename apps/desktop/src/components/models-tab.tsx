@@ -2,14 +2,24 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   AUTO_MODEL,
   FREENESS_LABELS,
+  catalogKey,
+  filterModels,
   formatBytes,
   parseCatalogKey,
   selectionKey,
+  detectProviderFromKey,
+  isConfident,
   OLLAMA_DEFAULT_ROOT,
+  OLLAMA_PROVIDER_ID,
+  ollamaRootFrom,
+  PROVIDERS,
   ZEN_PROVIDER_ID,
+  type ApiKeySource,
+  type CatalogModel,
   type Freeness,
   type Mode,
   type ModelFilters,
+  type ProviderDefinition,
   type Settings,
 } from "@atomic/core";
 import { Badge, Button, Card, CardBody, CardHeader, CardTitle, Input, Select, cn } from "@atomic/ui";
@@ -77,8 +87,273 @@ export function ModelsTab({ api, settings, mode, catalog, onSettings }: ModelsTa
 
       {tab === "models" ? (
         <ModelsBrowser api={api} settings={settings} mode={mode} catalog={catalog} onSettings={onSettings} />
-      ) : null}
+      ) : (
+        <ApiKeysTab api={api} settings={settings} />
+      )}
     </div>
+  );
+}
+
+/**
+ * Every provider's key, in one place, scoped to that provider.
+ *
+ * This tab used to be declared and then render `null`, so the only key field in
+ * the app lived in Settings bound to whichever provider was currently selected.
+ * Storing a second key therefore meant re-pointing the whole app at that
+ * provider first, and saving a key could silently move the app's active provider
+ * out from under the running chat -- which is what made the app look capable of
+ * holding only one or two keys.
+ *
+ * Each row is independent: saving here writes that provider's keychain slot and
+ * nothing else. Detection is a hint next to the field, with a one-click "save it
+ * to <provider>" that targets that provider's row, never the app's selection.
+ * Presence is re-read from the credential store after every write rather than
+ * assumed from the length of what was typed, so an unconfirmed write is reported
+ * as a failure.
+ */
+function ApiKeysTab({
+  api,
+  settings,
+}: {
+  readonly api: HostApi;
+  readonly settings: Settings;
+}) {
+  const [sources, setSources] = useState<Readonly<Record<string, ApiKeySource>>>({});
+  const [row, setRow] = useState<ApiKeyRow | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      setSources(await api.apiKeySources());
+    } catch {
+      setSources({});
+    }
+  }, [api]);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  // A catalog section is where a key first matters, so a save has to re-check it.
+  return (
+    <div className="space-y-3">
+      <p className="text-[11px] leading-snug text-content-muted">
+        Keys are stored in your OS credential store, never in Atomic's database.
+        Each provider keeps its own key, so saving one here does not change which
+        provider Atomic sends to.
+      </p>
+      {PROVIDERS.map((provider) => (
+        <ProviderKeyRow
+          key={provider.id}
+          provider={provider}
+          source={sources[provider.id] ?? "none"}
+          baseUrl={settings.providers[provider.id]?.baseUrl ?? ""}
+          api={api}
+          row={row?.providerId === provider.id ? row : null}
+          onRowChange={(next) =>
+            setRow((current) => (next === null ? null : { providerId: provider.id, ...next }))
+          }
+          onSaved={refresh}
+        />
+      ))}
+    </div>
+  );
+}
+
+interface ApiKeyRow {
+  readonly providerId: string;
+  readonly value: string;
+  readonly state: "idle" | "saving" | "saved" | "error";
+  readonly error: string | null;
+  readonly detectedProviderId: string | null;
+  readonly detectedLabel: string | null;
+  readonly detectionIsCertain: boolean;
+  /** The provider the last successful write actually went to. */
+  readonly savedProviderId: string | null;
+}
+
+function ProviderKeyRow({
+  provider,
+  source,
+  baseUrl,
+  api,
+  row,
+  onRowChange,
+  onSaved,
+}: {
+  readonly provider: ProviderDefinition;
+  readonly source: ApiKeySource;
+  readonly baseUrl: string;
+  readonly api: HostApi;
+  readonly row: ApiKeyRow | null;
+  readonly onRowChange: (row: Omit<ApiKeyRow, "providerId"> | null) => void;
+  readonly onSaved: () => void | Promise<void>;
+}) {
+  const value = row?.value ?? "";
+  const detected = useMemo(() => detectProviderFromKey(value), [value]);
+  // Ollama takes no key: a slot written for it would never be read, and the
+  // field would be a promise the app cannot keep.
+  const keyless = provider.id === OLLAMA_PROVIDER_ID;
+  const mismatch = detected.providerId !== null && detected.providerId !== provider.id;
+  const certain = isConfident(detected) && mismatch;
+
+  const labelFor = (id: string | null) =>
+    id === null ? null : (PROVIDERS.find((candidate) => candidate.id === id)?.label ?? id);
+
+  /**
+   * Where a paste of `value` is allowed to go.
+   *
+   * A conclusive mismatch gets exactly one destination -- the provider the key
+   * actually belongs to. The field it was pasted into is not an option, because
+   * the alternative is worse than doing nothing: it writes a working key over
+   * the slot for a different vendor, and the user finds out later as a
+   * confusing authentication failure with no trace of what replaced what.
+   *
+   * An inconclusive guess is left alone. Prefixes get shared, and for those the
+   * field the user chose is the one piece of evidence there is.
+   */
+  const saveTarget = certain ? (detected.providerId as string) : provider.id;
+
+  const set = (patch: Partial<Omit<ApiKeyRow, "providerId">>) =>
+    onRowChange({
+      value,
+      state: "idle",
+      error: null,
+      detectedProviderId: detected.providerId,
+      detectedLabel: detected.label,
+      detectionIsCertain: certain,
+      savedProviderId: null,
+      ...patch,
+    });
+
+  const save = async (target: string) => {
+    onRowChange({
+      value,
+      state: "saving",
+      error: null,
+      detectedProviderId: detected.providerId,
+      detectedLabel: detected.label,
+      detectionIsCertain: certain,
+      savedProviderId: target,
+    });
+    try {
+      await api.setApiKey(target, value.trim() || null);
+      // Presence comes from the credential store, not from the length of what
+      // was typed: a store that accepted the write and cannot return it would
+      // otherwise be reported here as a success.
+      const present = await api.hasApiKey(target);
+      if (present !== (value.trim().length > 0)) {
+        set({
+          state: "error",
+          error:
+            value.trim() === ""
+              ? "The key was not removed. Check your system credential store."
+              : "The credential store did not return the key, so Atomic cannot confirm it is usable.",
+        });
+        return;
+      }
+      set({ value: "", state: "saved", error: null });
+      await onSaved();
+    } catch (error) {
+      set({ state: "error", error: error instanceof Error ? error.message : String(error) });
+    }
+  };
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>{provider.label}</CardTitle>
+      </CardHeader>
+      <CardBody className="space-y-2">
+        {keyless ? (
+          <p className="text-[11px] text-content-muted">
+            Runs on this machine and needs no key.
+            {baseUrl ? ` Serving ${baseUrl}.` : ""}
+          </p>
+        ) : (
+          <>
+            <p className="text-[11px] text-content-muted">
+              {source === "keychain" ? (
+                <span className="text-content">Key saved in your OS credential store.</span>
+              ) : source === "env" ? (
+                <>
+                  No saved key. This provider is reached with the{" "}
+                  <code>{provider.envVar}</code> environment variable.
+                </>
+              ) : (
+                <>No key saved. {provider.note}</>
+              )}
+            </p>
+            <div className="flex gap-2">
+              <Input
+                type="password"
+                autoComplete="off"
+                spellCheck={false}
+                placeholder={source === "keychain" ? "Replace the saved key" : "Paste your API key"}
+                aria-label={`${provider.label} API key`}
+                value={value}
+                onChange={(event) => set({ value: event.target.value })}
+              />
+              <Button
+                onClick={() => void save(saveTarget)}
+                disabled={value.trim() === "" || row?.state === "saving"}
+              >
+                {row?.state === "saving"
+                  ? "Saving"
+                  : certain
+                    ? `Add to ${detected.label} instead`
+                    : "Save"}
+              </Button>
+              {source !== "none" ? (
+                <Button
+                  variant="ghost"
+                  onClick={() => void save(provider.id)}
+                  disabled={row?.state === "saving"}
+                  title={`Remove the ${provider.label} key`}
+                >
+                  Remove
+                </Button>
+              ) : null}
+            </div>
+            {mismatch ? (
+              <p className="text-[11px] leading-snug text-content-muted">
+                {`This looks like a ${detected.label} key.`}{" "}
+                {certain ? (
+                  <>
+                    Its shape is conclusive, so the button above adds it to{" "}
+                    {detected.label} and leaves {provider.label} untouched
+                    {row?.savedProviderId && row.savedProviderId !== provider.id
+                      ? ` — it is now saved under ${labelFor(row.savedProviderId)}.`
+                      : "."}
+                  </>
+                ) : (
+                  <>
+                    Many vendors share this prefix, so check before you rely on it. To add it to{" "}
+                    <button
+                      type="button"
+                      className="underline"
+                      onClick={() => void save(detected.providerId as string)}
+                    >
+                      {`${detected.label} instead`}
+                    </button>
+                    .
+                  </>
+                )}
+              </p>
+            ) : null}
+            {row?.error ? (
+              <p className="text-[11px] leading-snug text-danger">{row.error}</p>
+            ) : null}
+            {row?.state === "saved" ? (
+              <p className="text-[11px] text-content-muted">
+                {row.savedProviderId && row.savedProviderId !== provider.id
+                  ? `Saved to ${labelFor(row.savedProviderId)}.`
+                  : "Saved."}
+              </p>
+            ) : null}
+          </>
+        )}
+      </CardBody>
+    </Card>
   );
 }
 
@@ -100,7 +375,6 @@ function ModelsBrowser({
   return (
     <div className="space-y-4">
       <ModelFiltersBar catalog={catalog} />
-      <ModeDefaults settings={settings} catalog={catalog} onPick={pick} />
 
       {catalog.sections.map((section) => (
         <ProviderCatalogSection
@@ -173,7 +447,13 @@ function ModelFiltersBar({ catalog }: { readonly catalog: ModelCatalogState }) {
       <div className="flex flex-wrap gap-3 text-[11px] text-content-muted">
         {(
           [
-            ["freeOnly", "Free only"],
+            /*
+             * No "free only" checkbox here. The Free and Free tier chips below
+             * are the same filter with the cases named, and having both meant
+             * three controls whose labels overlapped: this one, the chips, and
+             * the spending policy in the header. The chips win because they can
+             * also show Unknown, which the checkbox cannot express.
+             */
             ["toolsOnly", "Supports tools"],
             ["localOnly", "Local only"],
           ] as const
@@ -216,68 +496,6 @@ function ModelFiltersBar({ catalog }: { readonly catalog: ModelCatalogState }) {
   );
 }
 
-/**
- * The three per-mode defaults, above the catalog.
- *
- * Placed here rather than in each section because a mode's default is the one
- * setting that is not scoped to a provider: it is the answer to "what does Chat
- * use", and the answer may be any of them.
- */
-function ModeDefaults({
-  settings,
-  catalog,
-  onPick,
-}: {
-  readonly settings: Settings;
-  readonly catalog: ModelCatalogState;
-  readonly onPick: (mode: Mode, modelId: string, providerId: string) => void;
-}) {
-  const modes: readonly Mode[] = ["chat", "cowork", "code"];
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle>Defaults per mode</CardTitle>
-      </CardHeader>
-      <CardBody className="space-y-2">
-        {modes.map((mode) => (
-          <label key={mode} className="flex items-center gap-3">
-            <span className="w-16 text-[11px] capitalize text-content-muted">{mode}</span>
-            <Select
-              aria-label={`Default model for ${mode} mode`}
-              className="h-7 flex-1 text-xs"
-              value={selectionKey(settings, mode) ?? AUTO_MODEL}
-              disabled={catalog.models.length === 0}
-              onChange={(event) => {
-                if (event.target.value === AUTO_MODEL) {
-                  void onPick(mode, AUTO_MODEL, settings.providerId);
-                  return;
-                }
-                const parsed = parseCatalogKey(event.target.value);
-                if (parsed) void onPick(mode, parsed.modelId, parsed.providerId);
-              }}
-            >
-              <option value={AUTO_MODEL}>
-                {mode === "chat" && catalog.auto?.modelName
-                  ? `Auto — ${catalog.auto.modelName}`
-                  : "Auto (best free)"}
-              </option>
-              {catalog.models.map((model) => (
-                <option key={model.key} value={model.key}>
-                  {model.providerLabel} / {model.name}
-                </option>
-              ))}
-            </Select>
-          </label>
-        ))}
-        <p className="text-[11px] text-content-muted">
-          A model id only means something together with its provider, so each mode records
-          both. Auto picks the best free model from the active provider.
-        </p>
-      </CardBody>
-    </Card>
-  );
-}
-
 function ProviderCatalogSection({
   api,
   section,
@@ -303,13 +521,7 @@ function ProviderCatalogSection({
   // Counted from the *unfiltered* list, so the summary does not change meaning
   // when a search box is used: it is a statement about what this provider offers,
   // not about what the filters happen to be showing right now.
-  const freeOptions = useMemo(
-    () =>
-      section.models.filter(
-        (model) => model.freeness === "free" && !model.unavailableReason,
-      ),
-    [section.models],
-  );
+  const breakdown = useMemo(() => freenessBreakdown(section.models), [section.models]);
 
   return (
     <Card>
@@ -329,7 +541,7 @@ function ProviderCatalogSection({
           // The number is the point. "Free" without a count leaves the user
           // hunting through badges to find out whether switching provider is
           // worth anything, which is the question this page exists to answer.
-          <FreeOptionsSummary count={freeOptions.length} total={section.models.length} />
+          <FreeOptionsSummary breakdown={breakdown} />
         )}
 
         {section.unconfigured ? null : section.models.length === 0 ? (
@@ -471,18 +683,72 @@ function ModelRow({
  * rows, and worded to say what it counted: models this provider offers that
  * Atomic can actually use.
  */
-function FreeOptionsSummary({ count, total }: { readonly count: number; readonly total: number }) {
-  if (count === total) {
+/**
+ * How a provider's models divide up, counted by the same value the badge reads.
+ *
+ * Every count here is a tally over one freeness value, so the header cannot
+ * disagree with the rows: a model badged "free tier" lands in the free-tier
+ * column because that is the badge it carries, and there is no second place for
+ * it to be counted.
+ */
+interface FreenessBreakdown {
+  readonly total: number;
+  readonly free: number;
+  readonly freeTier: number;
+  readonly paid: number;
+  readonly unknown: number;
+  readonly unusable: number;
+}
+
+function freenessBreakdown(models: readonly ModelOption[]): FreenessBreakdown {
+  const counts: Record<Freeness, number> = { free: 0, "free-tier": 0, paid: 0, unknown: 0 };
+  for (const model of models) counts[model.freeness] += 1;
+  return {
+    total: models.length,
+    free: counts.free,
+    freeTier: counts["free-tier"],
+    paid: counts.paid,
+    unknown: counts.unknown,
+    // Counted separately rather than removed from a category: a model that is
+    // both free and currently refused is still a free model, and hiding it
+    // behind a smaller total is what made the two numbers feel like different
+    // statements about the same list.
+    unusable: models.filter((model) => model.unavailableReason !== undefined).length,
+  };
+}
+
+function FreeOptionsSummary({ breakdown }: { readonly breakdown: FreenessBreakdown }) {
+  const { total, free, freeTier, paid, unknown, unusable } = breakdown;
+
+  if (free === total) {
     return (
       <p className="text-[11px] text-content-muted">
         All {total} available {total === 1 ? "model is" : "models are"} free to use.
+        {unusable > 0 ? ` ${unusable} of them ${unusable === 1 ? "is" : "are"} unusable in Atomic.` : ""}
       </p>
     );
   }
+
+  // Spelled out per category rather than collapsed into a single "free" number.
+  // Collapsing is what produced the original disagreement: a provider with 12
+  // free, 3 free tier and 2 unknown models announced "12 free of 17", and the
+  // other five rows were badged in words the header never mentioned.
+  const parts = [
+    free > 0 ? `${free} free` : null,
+    freeTier > 0 ? `${freeTier} free tier` : null,
+    unknown > 0 ? `${unknown} unknown` : null,
+    paid > 0 ? `${paid} paid` : null,
+  ].filter((part) => part !== null);
+
   return (
     <p className="text-[11px] text-content-muted">
-      {count} free of {total} {total === 1 ? "model" : "models"}.
-      {count === 0 ? " Nothing here is free, so Auto will not choose from this provider." : ""}
+      {parts.join(" · ")}, of {total} {total === 1 ? "model" : "models"}.
+      {free === 0
+        ? " Nothing here is confirmed free, so Auto will not choose from this provider."
+        : ""}
+      {unusable > 0
+        ? ` ${unusable} ${unusable === 1 ? "is" : "are"} marked unusable in Atomic.`
+        : ""}
     </p>
   );
 }
@@ -566,16 +832,35 @@ function OllamaControls({
    */
   const saveUrl = useCallback(async () => {
     const target = url.trim() || OLLAMA_DEFAULT_ROOT;
-    setBusy(true);
     setError(null);
-    const next = await api.updateSettings({
-      providers: { ollama: { baseUrl: target } },
-    });
-    onSettings(next);
-    // The cache is keyed per host, so the previous URL's list has to be
-    // refetched rather than reused.
-    catalog.reload();
-    setBusy(false);
+    /*
+     * Checked here rather than left to the host, so the message appears beside
+     * the field the user is looking at. The host rejects the same address, and
+     * the settings store now rolls a failed write back rather than reporting a
+     * change it did not make -- but both of those are invisible from here, and
+     * a save that silently does nothing reads as a broken button.
+     */
+    try {
+      ollamaRootFrom(target);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+      return;
+    }
+
+    setBusy(true);
+    try {
+      const next = await api.updateSettings({
+        providers: { ollama: { baseUrl: target } },
+      });
+      onSettings(next);
+      // The cache is keyed per host, so the previous URL's list has to be
+      // refetched rather than reused.
+      catalog.reload();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy(false);
+    }
   }, [api, catalog, onSettings, url]);
 
   const pull = useCallback(async () => {
@@ -716,22 +1001,44 @@ function CatalogSkeleton() {
   );
 }
 
-/** Apply the shared filters to one section's rows, without re-deriving the catalog. */
+/**
+ * Apply the shared filters to one section's rows, without re-deriving the
+ * catalog.
+ *
+ * Delegates to the core filter rather than reimplementing it. The two copies
+ * disagreed -- this one honoured `freeness` and the header picker's did not --
+ * so the same chips narrowed the list in one place and did nothing in the
+ * other, and there was no way to tell which of them was wrong.
+ */
 function filterSectionModels(
   models: readonly ModelOption[],
   filters: ModelFilters,
 ): readonly ModelOption[] {
-  const query = filters.query?.trim().toLowerCase() ?? "";
-  return models.filter((model) => {
-    if (filters.freeOnly && model.freeness !== "free" && model.freeness !== "free-tier") return false;
-    if (filters.freeness && !filters.freeness.includes(model.freeness)) return false;
-    if (filters.toolsOnly && !model.tools) return false;
-    if (filters.localOnly && !model.local) return false;
-    if (!query) return true;
-    return (
-      model.id.toLowerCase().includes(query) ||
-      model.name.toLowerCase().includes(query) ||
-      model.providerLabel.toLowerCase().includes(query)
-    );
-  });
+  const asCatalog: readonly CatalogModel[] = models.map(toCatalogModel);
+  const kept = new Set(
+    filterModels(asCatalog, filters).map((model) => catalogKey(model.providerId, model.id)),
+  );
+  return models.filter((model) => kept.has(catalogKey(model.providerId, model.id)));
+}
+
+/**
+ * The shape the core filter takes.
+ *
+ * Named here because the header picker needs the same projection, and two
+ * projections that drift produce exactly the bug the delegation above fixes.
+ */
+export function toCatalogModel(model: ModelOption): CatalogModel {
+  return {
+    id: model.id,
+    name: model.name,
+    providerId: model.providerId,
+    providerLabel: model.providerLabel,
+    freeness: model.freeness,
+    freenessReason: model.freenessReason,
+    ...(model.contextWindow !== undefined ? { contextWindow: model.contextWindow } : {}),
+    tools: model.tools,
+    vision: model.vision,
+    reasoning: model.reasoning,
+    local: model.local,
+  };
 }

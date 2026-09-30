@@ -24,18 +24,102 @@ export const OLLAMA_PROVIDER_ID = "ollama";
 export const OLLAMA_DEFAULT_ROOT = "http://localhost:11434";
 
 /**
+ * Why a configured Ollama URL cannot be used.
+ *
+ * Named rather than a bare string because each case has a different fix, and the
+ * generic failure for all of them is a fetch error about protocol or DNS that
+ * points at neither.
+ */
+export class OllamaUrlError extends Error {
+  readonly input: string;
+
+  constructor(input: string, message: string) {
+    super(message);
+    this.name = "OllamaUrlError";
+    this.input = input;
+  }
+}
+
+/**
  * The native API root, derived from a base URL that may be the OpenAI-compatible
  * one.
  *
  * The registry points completions at `<root>/v1` because that is the shape
  * `openai-chat` speaks, but `/api/tags` lives at the root. Deriving one from the
  * other means a user who edits the URL in Settings only edits it once.
+ *
+ * A URL that is present but unusable is rejected rather than replaced with the
+ * default. Silently falling back meant a typo in the address field -- `htp://`,
+ * a missing scheme, a stray path -- produced "Ollama isn't running at
+ * localhost:11434", which is both untrue and points at the one thing that was
+ * not wrong.
  */
 export function ollamaRootFrom(baseUrl: string | null | undefined): string {
   const trimmed = (baseUrl ?? "").trim();
+  // Unset is a legitimate state: Ollama runs with no configuration at all.
   if (!trimmed) return OLLAMA_DEFAULT_ROOT;
   const withoutSlash = trimmed.replace(/\/+$/, "");
-  return withoutSlash.replace(/\/v\d+$/, "") || OLLAMA_DEFAULT_ROOT;
+  const root = withoutSlash.replace(/\/v\d+$/, "");
+  if (!root) return OLLAMA_DEFAULT_ROOT;
+  validateOllamaUrl(root, trimmed);
+  return root;
+}
+
+/**
+ * Reject a URL that cannot reach Ollama, saying which part is wrong.
+ *
+ * The checks are only the ones with a different remedy each: a missing scheme,
+ * a scheme that is not http(s), a host that is not a hostname or address, and a
+ * path where a base URL should end. Everything else is left to the request,
+ * which reports it better than a regex can.
+ */
+function validateOllamaUrl(root: string, original: string): void {
+  /*
+   * Checked before parsing because `new URL` does not reject it: given
+   * `localhost:11434` it reads "localhost" as the scheme and "11434" as the
+   * path, so the mistake would be reported as a nonsense protocol rather than
+   * as the missing `http://` that it actually is. A scheme is always followed by
+   * `//`, so its absence is unambiguous.
+   */
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(root)) {
+    throw new OllamaUrlError(
+      original,
+      `\`${original}\` is not a usable Ollama address. It needs a scheme, as in http://localhost:11434.`,
+    );
+  }
+
+  let url: URL;
+  try {
+    url = new URL(root);
+  } catch {
+    // The overwhelmingly common shape of this is a host with no scheme, which
+    // `new URL` rejects and `fetch` would treat as a relative path.
+    throw new OllamaUrlError(
+      original,
+      `\`${original}\` is not a usable Ollama address. It needs a scheme, as in http://localhost:11434.`,
+    );
+  }
+
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new OllamaUrlError(
+      original,
+      `\`${original}\` uses ${url.protocol.replace(":", "")}, which cannot reach Ollama. Use http, or https if you have put it behind a TLS proxy.`,
+    );
+  }
+
+  if (!url.hostname) {
+    throw new OllamaUrlError(original, `\`${original}\` has no host in it.`);
+  }
+
+  // A path means the address is probably a completions URL, a proxied mount
+  // point, or a copy of the wrong field. Either way `/api/tags` will not be there.
+  const path = url.pathname.replace(/\/+$/, "");
+  if (path) {
+    throw new OllamaUrlError(
+      original,
+      `\`${original}\` should be Ollama's base address with no path after the host -- for example http://localhost:11434. Found \`${path}\`.`,
+    );
+  }
 }
 
 export interface OllamaModelSummary {

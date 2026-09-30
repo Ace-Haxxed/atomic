@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { ZenProvider } from "./provider.js";
+import { ZenProvider, providerCacheKey } from "./provider.js";
+import { ZEN_BASE_URL, ZEN_PROVIDER_ID } from "./catalog.js";
 import { migratedTestDatabase } from "../../storage/sqlite.test-support.js";
 import type { Database } from "../../storage/database.js";
 
@@ -19,7 +20,7 @@ async function readAvailability(db: Database): Promise<{
 } | null> {
   const rows = await db.select<{ payload: string }>(
     "SELECT payload FROM model_cache WHERE provider_id = ?",
-    ["zen.atomicavailability"],
+    [providerCacheKey("atomicavailability", ZEN_PROVIDER_ID, ZEN_BASE_URL)],
   );
   return rows[0] ? JSON.parse(rows[0].payload) : null;
 }
@@ -268,10 +269,18 @@ describe("learning unavailability", () => {
     for (const status of [429, 500, 502, 503]) {
       const db = await migratedTestDatabase();
       const zen = noRetryProvider(
-        async () =>
-          new Response(JSON.stringify({ error: { message: "later" } }), {
-            status,
-          }),
+        // The catalog answers; only the chat call fails. Resolving the wire
+        // format consults the catalog first, and a stub that failed that too
+        // made this test spend seconds in the catalog's real retry backoff --
+        // the very thing `noRetryProvider` exists to prevent.
+        async (url) =>
+          url.includes("/models")
+            ? new Response(JSON.stringify({ data: [{ id: "some-model" }] }), {
+                status: 200,
+              })
+            : new Response(JSON.stringify({ error: { message: "later" } }), {
+                status,
+              }),
         db,
       );
       for (let i = 0; i < 3; i += 1) {
@@ -467,5 +476,173 @@ describe("rechecking on refresh", () => {
       models.models.find((entry) => entry.id === "big-pickle")
         ?.unavailableInAtomic,
     ).toBeUndefined();
+  });
+});
+
+/**
+ * Counting refusals was not enough, because two refusals can come from the same
+ * bad minute. Before a model is written off it is asked again, and only the
+ * answer decides.
+ */
+describe("re-checking before declaring a model unavailable", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /**
+   * A transport whose chat responses come from a script, in order, with the last
+   * entry repeated once the script runs out. Counts calls so a test can assert
+   * that a request was or was not made.
+   */
+  function scripted(script: readonly Response[]): {
+    fetch: typeof fetch;
+    calls: () => number;
+  } {
+    let calls = 0;
+    const fetchImpl = (async (url: string | URL | Request) => {
+      const target = String(url);
+      if (target.includes("/chat/completions")) {
+        const next = script[Math.min(calls, script.length - 1)]!;
+        calls += 1;
+        return next.clone();
+      }
+      if (target.startsWith("https://opencode.ai/zen/v1/models")) {
+        return new Response(
+          JSON.stringify({ data: [{ id: "big-pickle", name: "Big Pickle" }] }),
+          { status: 200 },
+        );
+      }
+      if (target.startsWith("https://models.dev/")) {
+        return new Response(JSON.stringify({}), { status: 200 });
+      }
+      if (target.includes("docs/zen")) {
+        return new Response("<html>no pricing here</html>", { status: 200 });
+      }
+      throw new Error(`unstubbed request: ${target}`);
+    }) as unknown as typeof fetch;
+    return { fetch: fetchImpl, calls: () => calls };
+  }
+
+  const refused = () => new Response(FREE_TIER_BODY, { status: 403 });
+  const answered = () => new Response(okBody(), { status: 200 });
+
+  it("does not re-check on the first refusal", async () => {
+    // One refusal is already only a suspicion, so there is nothing to second-
+    // guess and no reason to spend a request.
+    const db = await migratedTestDatabase();
+    const { fetch: fetchImpl, calls } = scripted([refused()]);
+    const zen = noRetryProvider(fetchImpl, db);
+
+    await expect(zen.complete(chat("big-pickle"))).rejects.toMatchObject({ status: 403 });
+    expect(calls()).toBe(1);
+    expect(await readAvailability(db)).toMatchObject({ suspect: { "big-pickle": { count: 1 } } });
+  });
+
+  it("keeps a model that answers when re-checked", async () => {
+    // The reported failure, exactly: `space-bunny-free` was reported unavailable
+    // while it was answering. Two refusals, then a re-check that works -- which
+    // means every refusal so far was wrong, and none of it is written down.
+    const db = await migratedTestDatabase();
+    const { fetch: fetchImpl, calls } = scripted([refused(), refused(), answered()]);
+    const zen = noRetryProvider(fetchImpl, db);
+
+    await expect(zen.complete(chat("big-pickle"))).rejects.toMatchObject({ status: 403 });
+    await expect(zen.complete(chat("big-pickle"))).rejects.toMatchObject({ status: 403 });
+
+    const learned = await readAvailability(db);
+    expect(learned?.blocked ?? {}).toEqual({});
+    expect(learned?.suspect ?? {}).toEqual({});
+    expect(learned?.reachable).toContain("big-pickle");
+    // The third call is the re-check, and it is what the verdict was based on.
+    expect(calls()).toBe(3);
+
+    const row = (await zen.listModels()).models.find((entry) => entry.id === "big-pickle");
+    expect(row?.unavailableInAtomic).toBeUndefined();
+    expect(row?.suspectedInAtomic).toBeUndefined();
+  });
+
+  it("writes the model off when the re-check is refused the same way", async () => {
+    const db = await migratedTestDatabase();
+    const { fetch: fetchImpl, calls } = scripted([refused()]);
+    const zen = noRetryProvider(fetchImpl, db);
+
+    await expect(zen.complete(chat("big-pickle"))).rejects.toMatchObject({ status: 403 });
+    await expect(zen.complete(chat("big-pickle"))).rejects.toMatchObject({ status: 403 });
+
+    const learned = await readAvailability(db);
+    expect(Object.keys(learned?.blocked ?? {})).toEqual(["big-pickle"]);
+    // Two attempts plus the one that confirmed them.
+    expect(calls()).toBe(3);
+  });
+
+  it("does not write a model off when the re-check fails for an unrelated reason", async () => {
+    // A 500 is the server, not the model. Blocking on it would mean an app that
+    // hit one bad minute greyed out every free model it had, permanently.
+    const db = await migratedTestDatabase();
+    const { fetch: fetchImpl } = scripted([
+      refused(),
+      refused(),
+      new Response("upstream exploded", { status: 500 }),
+    ]);
+    const zen = noRetryProvider(fetchImpl, db);
+
+    await expect(zen.complete(chat("big-pickle"))).rejects.toMatchObject({ status: 403 });
+    await expect(zen.complete(chat("big-pickle"))).rejects.toMatchObject({ status: 403 });
+
+    const learned = await readAvailability(db);
+    expect(learned?.blocked ?? {}).toEqual({});
+    // Still recorded as refused, just never as settled.
+    expect(learned?.suspect["big-pickle"]?.count).toBe(2);
+
+    const row = (await zen.listModels()).models.find((entry) => entry.id === "big-pickle");
+    expect(row?.unavailableInAtomic).toBeUndefined();
+    expect(row?.suspectedInAtomic?.count).toBe(2);
+  });
+
+  it("treats a rate limit during the re-check as no evidence", async () => {
+    const db = await migratedTestDatabase();
+    const { fetch: fetchImpl } = scripted([
+      refused(),
+      refused(),
+      new Response("slow down", { status: 429 }),
+    ]);
+    const zen = noRetryProvider(fetchImpl, db);
+
+    await expect(zen.complete(chat("big-pickle"))).rejects.toMatchObject({ status: 403 });
+    await expect(zen.complete(chat("big-pickle"))).rejects.toMatchObject({ status: 403 });
+    expect((await readAvailability(db))?.blocked ?? {}).toEqual({});
+  });
+
+  it("does not re-check a model it has already written off", async () => {
+    // Once blocked there is nothing left to confirm, and a probe per failed
+    // request would turn a greyed-out row into a request amplifier.
+    const db = await migratedTestDatabase();
+    const { fetch: fetchImpl, calls } = scripted([refused()]);
+    const zen = noRetryProvider(fetchImpl, db);
+
+    await expect(zen.complete(chat("big-pickle"))).rejects.toMatchObject({ status: 403 });
+    await expect(zen.complete(chat("big-pickle"))).rejects.toMatchObject({ status: 403 });
+    const afterConfirm = calls();
+
+    await expect(zen.complete(chat("big-pickle"))).rejects.toMatchObject({ status: 403 });
+    // One call for the request itself, and no re-check on top of it.
+    expect(calls()).toBe(afterConfirm + 1);
+  });
+
+  it("clears a block when the model answers on a later attempt", async () => {
+    // The gate can be lifted. A model that works again is usable again, without
+    // waiting for a cache clear or a reinstall.
+    const db = await migratedTestDatabase();
+    const { fetch: fetchImpl } = scripted([refused(), refused(), refused(), answered()]);
+    const zen = noRetryProvider(fetchImpl, db);
+
+    await expect(zen.complete(chat("big-pickle"))).rejects.toMatchObject({ status: 403 });
+    await expect(zen.complete(chat("big-pickle"))).rejects.toMatchObject({ status: 403 });
+    expect(Object.keys((await readAvailability(db))?.blocked ?? {})).toEqual(["big-pickle"]);
+
+    await zen.complete(chat("big-pickle"));
+    const learned = await readAvailability(db);
+    expect(learned?.blocked ?? {}).toEqual({});
+    expect(learned?.reachable).toContain("big-pickle");
   });
 });

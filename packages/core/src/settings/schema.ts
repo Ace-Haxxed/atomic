@@ -264,6 +264,25 @@ export const SettingsSchema = z.object({
   customSlashCommands: z.array(SlashCommandSchema).default(() => []),
   mcpServers: z.array(McpServerSchema).default(() => []),
 
+  /**
+   * Folders the agent may reach in addition to the open workspace.
+   *
+   * The workspace is chosen per conversation and is the only root a path is
+   * resolved against by default. This list is how a user widens that once, for
+   * every conversation, without handing the *model* the ability to do it: a path
+   * is authorized if it lands inside any entry here, and the only way an entry
+   * gets added is the user picking a folder in the UI.
+   *
+   * That distinction is the whole security model. A model that could name a new
+   * root would be able to read `~/.ssh` or `~/.aws` by asking; a user who adds
+   * `/home/me/Code` has said something specific and is responsible for it.
+   */
+  files: z
+    .object({
+      allowedFolders: z.array(z.string().min(1).max(4096)).default(() => []),
+    })
+    .default(() => ({ allowedFolders: [] })),
+
   /** No telemetry, ever, unless the user opts in. */
   telemetryEnabled: z.boolean().default(false),
   loadProjectMemory: z.boolean().default(true),

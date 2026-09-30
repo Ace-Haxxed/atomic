@@ -27,17 +27,23 @@ import {
 import { Badge, Button, Select, Spinner, cn } from "@atomic/ui";
 
 import { useAgentRun } from "./use-agent-run.js";
+import { startNewChat } from "./new-chat.js";
 import { useModeResolutions, useModels } from "./use-models.js";
-import { ModelSelect, AutoModelNote } from "../components/model-select.js";
+import {
+  ModelSelect,
+  AutoModelNote,
+  OnlyFreeToggle,
+} from "../components/model-select.js";
 import { ApprovalCard } from "../components/approval-card.js";
 import { PlanApproval } from "../components/plan-approval.js";
 import { PaidModelPrompt } from "../components/paid-model-prompt.js";
+import { ProviderOffer } from "../components/provider-offer.js";
 import { Composer } from "../components/composer.js";
 import { runSlashCommand } from "./slash-commands.js";
 import { MessageList, type FailedMessage } from "../components/message-list.js";
 import { Onboarding } from "../components/onboarding.js";
 import { SettingsPanel } from "../components/settings-panel.js";
-import { Icon, Sidebar } from "../components/sidebar.js";
+import { Icon, MODE_LABELS, Sidebar } from "../components/sidebar.js";
 import { window as hostWindow } from "../lib/host.js";
 
 type Overlay = "none" | "settings";
@@ -56,6 +62,28 @@ export function App({ api, degraded = null }: AppProps) {
   const [overlay, setOverlay] = useState<Overlay>("none");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [fatal, setFatal] = useState<string | null>(null);
+  /**
+   * A failed action that must not take the window down with it.
+   *
+   * `fatal` is for the app being unable to start. "New chat" failing is a
+   * button that did not work, and answering that by replacing the transcript
+   * with "Atomic could not start" is the loudest possible way to say nothing
+   * useful: the user's conversation is still on screen underneath and still
+   * fine, so the error destroys working state to report a non-event.
+   */
+  const [actionError, setActionError] = useState<string | null>(null);
+  /**
+   * Bumped to remount the composer, which is how a new chat gets an empty
+   * composer.
+   *
+   * The composer owns its draft in local state and has no key, so it survives
+   * everything above it: switching conversations, switching modes and pressing
+   * "New chat" all left the half-typed message in the box. A remount clears the
+   * text, the attachments and the command menu together, and takes focus with it
+   * -- which is also the second thing that was broken, since focus was left on
+   * the button the user had just pressed.
+   */
+  const [draftKey, setDraftKey] = useState(0);
 
   const run = useAgentRun(api);
 
@@ -133,22 +161,24 @@ export function App({ api, degraded = null }: AppProps) {
    * one, which is the behaviour you want once you are actually working.
    */
   const newChat = useCallback(async () => {
-    try {
-      const all = await api.listConversations().catch(() => []);
-      const { reuse, prune } = pickConversationForMode(all, mode);
-      for (const id of prune) {
-        await api.deleteConversation(id).catch(() => undefined);
-      }
-      if (reuse) {
-        await openConversation(reuse.id);
-        return;
-      }
-      const created = await api.createConversation({ mode });
-      setConversation(created);
-      setMessages([]);
-    } catch (error) {
-      setFatal(error instanceof Error ? error.message : String(error));
+    const outcome = await startNewChat({
+      api,
+      mode,
+      nameOf: (which) => MODE_LABELS[which],
+      open: async (conversationId) => {
+        await openConversation(conversationId);
+      },
+    });
+
+    if (outcome.error !== undefined) {
+      // Reported against the button that was pressed. `setFatal` here replaced
+      // the whole window with "Atomic could not start", destroying a
+      // conversation that was on screen and perfectly fine.
+      setActionError(outcome.error);
+      return;
     }
+    setActionError(null);
+    if (outcome.draftReset) setDraftKey((key) => key + 1);
   }, [api, mode, openConversation]);
 
   /**
@@ -263,6 +293,7 @@ export function App({ api, degraded = null }: AppProps) {
       text: string,
       attachments: Parameters<HostApi["sendMessage"]>[0]["attachments"] = [],
       allowPaidModel = false,
+      on?: { readonly model: string; readonly providerId: string },
     ) => {
       if (!conversation) return;
       try {
@@ -271,6 +302,10 @@ export function App({ api, degraded = null }: AppProps) {
           text,
           attachments,
           ...(allowPaidModel ? { allowPaidModel: true } : {}),
+          // A named model and provider together, because a model id alone would
+          // be re-resolved against the catalog and could land back on the
+          // account that just failed.
+          ...(on ? { model: on.model, providerId: on.providerId } : {}),
         });
         setPendingPaid(null);
         setPolicyNotice(null);
@@ -443,10 +478,32 @@ export function App({ api, degraded = null }: AppProps) {
               settings={settings}
               mode={mode}
               onChange={(id, providerId) => {
-                void api.setModelForMode(mode, id, providerId).then((next) => setSettings(next));
+                /*
+                 * The write can fail, and now that the store rolls back it is
+                 * honest about having changed nothing -- so the error has to be
+                 * shown. It used to be an unhandled rejection: the picker kept
+                 * the new name because nothing re-rendered, the next message
+                 * went to the old model, and the failure was invisible.
+                 */
+                setActionError(null);
+                api
+                  .setModelForMode(mode, id, providerId)
+                  .then((next) => setSettings(next))
+                  .catch((error: unknown) => {
+                    setActionError(
+                      `Could not save that model choice: ${error instanceof Error ? error.message : String(error)}`,
+                    );
+                  });
               }}
             />
             {modelCatalog.usingAuto ? <AutoModelNote state={modelCatalog} /> : null}
+            {/*
+              The spending policy lives beside the model picker, because that is
+              the choice it qualifies. It used to be a component that nothing
+              rendered, so the promise this app makes about money had no control
+              anywhere in the window.
+            */}
+            <OnlyFreeToggle state={modelCatalog} />
           </span>
 
           {/* Only where tools exist; see hasTools(). */}
@@ -551,7 +608,9 @@ export function App({ api, degraded = null }: AppProps) {
           pendingApproval={run.pendingApprovals.length > 0}
           error={run.error}
           usage={run.usage}
-          notice={run.modelSwitched}
+          notices={[run.modelSwitched, run.note].filter(
+            (line): line is string => Boolean(line),
+          )}
           truncated={run.truncated}
           onContinue={conversation ? () => void continueAnswer() : undefined}
           failedMessage={failedMessage}
@@ -568,6 +627,14 @@ export function App({ api, degraded = null }: AppProps) {
         </div>
 
         <div className="mx-auto w-full max-w-3xl space-y-2 px-4">
+          {actionError ? (
+            <p
+              role="alert"
+              className="border-border text-danger bg-danger/5 rounded-md border px-3 py-2 text-sm"
+            >
+              {actionError}
+            </p>
+          ) : null}
           {policyNotice ? (
             <p
               role="status"
@@ -575,6 +642,49 @@ export function App({ api, degraded = null }: AppProps) {
             >
               {policyNotice}
             </p>
+          ) : null}
+          {/*
+            Gated on the run alone. It used to require a ref holding the text
+            the run had been sent, and that ref was cleared on every send: a
+            second send before the offer was answered left the offer
+            unrenderable, so the choice quietly disappeared and the run was
+            stuck.
+          */}
+          {run.providerOffer ? (
+            <ProviderOffer
+              model={run.providerOffer.model}
+              providerLabel={run.providerOffer.providerLabel}
+              reason={run.providerOffer.reason}
+              busy={run.isBusy}
+              /*
+               * Not `send`. The question behind this offer is already in the
+               * transcript -- it was written down before the run that failed --
+               * so re-sending the text appended it a second time. This re-runs
+               * the turn that is already there, on the provider just agreed to.
+               */
+              onAccept={() => {
+                if (!conversation) return;
+                setActionError(null);
+                api
+                  .retryOnProvider({
+                    conversationId: conversation.id,
+                    model: run.providerOffer!.model,
+                    providerId: run.providerOffer!.providerId,
+                  })
+                  .catch((error: unknown) => {
+                    setActionError(
+                      `Could not retry on ${run.providerOffer!.providerLabel}: ${
+                        error instanceof Error ? error.message : String(error)
+                      }`,
+                    );
+                  });
+              }}
+              onDecline={() => {
+                // The run is over either way; the model list is where the choice
+                // can actually be made.
+                setOverlay("settings");
+              }}
+            />
           ) : null}
           {pendingPaid ? (
             <PaidModelPrompt
@@ -627,6 +737,7 @@ export function App({ api, degraded = null }: AppProps) {
         </div>
 
         <Composer
+          key={draftKey}
           disabled={run.isBusy || conversation === null}
           sendKey={settings.sendKey}
           workspace={conversation?.workspace ?? null}

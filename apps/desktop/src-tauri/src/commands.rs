@@ -98,7 +98,7 @@ fn validate_key(key: &str) -> Result<(), String> {
     if ok {
         Ok(())
     } else {
-        Err(format!("invalid secret key: {key}"))
+        Err("invalid secret key name".to_string())
     }
 }
 
@@ -304,35 +304,60 @@ pub fn attach_from_base64(name: String, data: String) -> Result<Attachment, Stri
 // Environment
 // ---------------------------------------------------------------------------
 
-/// Provider keys the webview is allowed to see.
+/// The provider-key variables Atomic is willing to look at.
 ///
-/// An allowlist, not a dump. `HostServices.env` is indexed by the *user's* chosen
-/// `apiKeyEnvVar`, and a settings value that could name any variable would turn
-/// "read the model key" into "exfiltrate any secret in the process environment".
+/// An allowlist, not a dump. `apiKeyEnvVar` is a user-editable setting, so a
+/// variable name that could be anything would turn "read the model key" into
+/// "exfiltrate any secret in the process environment".
+const PROVIDER_KEY_VARS: &[&str] = &[
+    "OPENCODE_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "GROQ_API_KEY",
+    "XAI_API_KEY",
+    "MISTRAL_API_KEY",
+    "OPENROUTER_API_KEY",
+    "OLLAMA_API_KEY",
+];
+
+fn allowed_env_var(name: &str) -> Option<String> {
+    if !PROVIDER_KEY_VARS.contains(&name) {
+        return None;
+    }
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Which provider keys are set, with no values.
+///
+/// The UI needs this to say "reached by environment" next to a provider, and a
+/// boolean cannot be turned back into a credential by anything downstream.
 #[tauri::command]
-pub fn env_provider_keys() -> std::collections::BTreeMap<String, String> {
-    const ALLOWED: &[&str] = &[
-        "OPENCODE_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "OPENAI_API_KEY",
-        "GEMINI_API_KEY",
-        "GOOGLE_API_KEY",
-        "DEEPSEEK_API_KEY",
-        "GROQ_API_KEY",
-        "XAI_API_KEY",
-        "MISTRAL_API_KEY",
-        "OPENROUTER_API_KEY",
-        "OLLAMA_API_KEY",
-    ];
-    ALLOWED
+pub fn env_provider_key_presence() -> std::collections::BTreeMap<String, bool> {
+    PROVIDER_KEY_VARS
         .iter()
-        .filter_map(|name| {
-            std::env::var(name)
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .map(|value| ((*name).to_string(), value))
-        })
+        .map(|name| ((*name).to_string(), allowed_env_var(name).is_some()))
         .collect()
+}
+
+/// One provider key, read on demand.
+///
+/// This replaces handing the webview every key at startup: a value is fetched
+/// only when a provider is actually being built, crosses into the webview only
+/// for that request's `Authorization` header, and is never stored in a
+/// long-lived map the UI could enumerate. Unlisted names are refused here rather
+/// than trusted, because the name arrives from a settings value.
+#[tauri::command]
+pub fn env_provider_key_read(name: String) -> Result<Option<String>, String> {
+    if !PROVIDER_KEY_VARS.contains(&name.as_str()) {
+        return Err(format!("{name} is not a provider key Atomic will read"));
+    }
+    Ok(allowed_env_var(&name))
 }
 
 #[tauri::command]

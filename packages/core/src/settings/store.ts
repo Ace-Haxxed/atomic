@@ -117,12 +117,27 @@ export class SettingsStore {
     );
   }
 
+  /**
+   * Apply a change, and only keep it if it was written down.
+   *
+   * The in-memory value is rolled back when the write fails. It used to be
+   * assigned first and persisted second, so a failed write left the app
+   * confidently reporting a setting that had not been stored anywhere: the
+   * picker showed the model the user had just chosen, the next message went to
+   * it, and on relaunch the choice was simply gone. Failing the write is
+   * visible; silently holding state nobody persisted is not.
+   */
   async #patch(produce: (current: Settings) => Settings): Promise<Settings> {
     const previous = this.#current;
     const next = produce(previous);
     this.#current = next;
     if (previous === next) return next;
-    await this.#persist(next);
+    try {
+      await this.#persist(next);
+    } catch (error) {
+      this.#current = previous;
+      throw error;
+    }
     for (const listener of this.#listeners) {
       try {
         listener(next, previous);

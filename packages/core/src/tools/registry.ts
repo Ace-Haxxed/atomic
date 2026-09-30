@@ -21,6 +21,17 @@ export interface ToolContext {
   readonly signal: AbortSignal;
   /** Absolute workspace root for file tools; null when the mode has no workspace. */
   readonly workspace: string | null;
+  /**
+   * Folders the user has authorized in addition to `workspace`.
+   *
+   * Kept separate from `workspace` rather than merged into it, because the
+   * difference is meaningful: `workspace` is where this conversation is and every
+   * relative path is measured from it, while these are somewhere else entirely
+   * and only reachable by writing a full path. Anything that assumes a single
+   * root -- process execution, git, checkpoints, project memory -- keeps using
+   * `workspace` alone and cannot wander into them by accident.
+   */
+  readonly extraRoots: readonly string[];
   /** Human-readable one-liner for the audit log and the UI card header. */
   readonly describe: (args: Record<string, unknown>) => string;
 }

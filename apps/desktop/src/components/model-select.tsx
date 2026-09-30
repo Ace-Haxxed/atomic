@@ -13,6 +13,7 @@ import {
   type Settings,
 } from "@atomic/core";
 import type { AutoResolution, ModelCatalogState, ModelOption } from "../app/use-models.js";
+import { toCatalogModel } from "./models-tab.js";
 import { Button, Select } from "@atomic/ui";
 
 /**
@@ -151,20 +152,14 @@ function groupByProvider(
   return [...groups];
 }
 
+/**
+ * The shape the core filter takes.
+ *
+ * Imported rather than re-declared: two projections of the same row that drift
+ * produce two filters that disagree, which is what this file's copy did.
+ */
 function toCatalog(models: readonly ModelOption[]): readonly CatalogModel[] {
-  return models.map((model) => ({
-    id: model.id,
-    name: model.name,
-    providerId: model.providerId,
-    providerLabel: model.providerLabel,
-    freeness: model.freeness,
-    freenessReason: model.freenessReason,
-    ...(model.contextWindow !== undefined ? { contextWindow: model.contextWindow } : {}),
-    tools: model.tools,
-    vision: model.vision,
-    reasoning: model.reasoning,
-    local: model.local,
-  }));
+  return models.map(toCatalogModel);
 }
 
 /** Best-effort option value when the caller did not pass settings. */
@@ -260,16 +255,33 @@ export function AutoModelNote({ state }: { readonly state: ModelCatalogState }) 
   );
 }
 
-/** The only-free policy toggle, shown next to the picker. */
+/**
+ * The free-only policy, the one control that governs whether Atomic may spend.
+ *
+ * Rendered next to the header picker because that is the only place a user is
+ * making a model choice, and the policy is a precondition of that choice rather
+ * than a setting somewhere else. It was exported and rendered nowhere, so the
+ * app's central promise -- that it will not spend your money -- had no visible
+ * control at all: not off by accident, simply absent, and a user who wanted to
+ * allow a paid model had no way to ask for one.
+ *
+ * Named to be unambiguous about what it governs. The models tab has a separate
+ * "Free only" *filter*, which only hides rows in a list; having two controls
+ * with that name, one cosmetic and one about money, is how the wrong one gets
+ * trusted.
+ */
 export function OnlyFreeToggle({ state }: { readonly state: ModelCatalogState }) {
   return (
-    <label className="flex items-center gap-1.5 text-xs text-content-muted">
+    <label
+      className="flex items-center gap-1.5 text-xs text-content-muted"
+      title="Atomic will not send anything to a model it has seen charge money. A model that publishes no price is asked about per message rather than assumed free."
+    >
       <input
         type="checkbox"
         checked={state.onlyFree}
         onChange={(event) => state.setOnlyFree(event.target.checked)}
       />
-      Only auto-select free models
+      Free models only
     </label>
   );
 }

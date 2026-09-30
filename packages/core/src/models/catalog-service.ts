@@ -172,10 +172,20 @@ function matchesQuery(model: CatalogModel, query: string): boolean {
 /**
  * Apply the search box and the filters.
  *
+ * The single implementation, used by the settings browser *and* the header
+ * picker. It was duplicated per surface, and the copy in the header silently
+ * ignored `freeness` -- so the Free / Unknown / Paid chips narrowed the list in
+ * Settings and did nothing in the dropdown, which looks like the chips are
+ * broken rather than like two filters disagree.
+ *
  * "Free only" keeps models whose freeness is confirmed `free` *or* `free-tier`,
  * because a rate-limited free tier still costs the user nothing, which is what
  * the filter is asking about. `unknown` is excluded: a model with no reported
  * price must not appear under a filter that promises it is free.
+ *
+ * `freeness` is applied *after* `freeOnly` rather than instead of it, so a
+ * filter object carrying both is the intersection. Neither is removed: they are
+ * two shapes the same question can arrive in, and one of them is a checkbox.
  */
 export function filterModels(
   models: readonly CatalogModel[],
@@ -183,6 +193,11 @@ export function filterModels(
 ): readonly CatalogModel[] {
   return models.filter((model) => {
     if (filters.freeOnly && model.freeness !== "free" && model.freeness !== "free-tier") {
+      return false;
+    }
+    // An empty group list is not "show nothing": it is the absence of a choice,
+    // and treating it as an empty intersection hid every row in the catalog.
+    if (filters.freeness && filters.freeness.length > 0 && !filters.freeness.includes(model.freeness)) {
       return false;
     }
     if (filters.toolsOnly && !model.tools) return false;

@@ -28,11 +28,18 @@ function withMode(mode: Mode, patch: Record<string, unknown>): Settings {
   return SettingsSchema.parse({ permissions: { [mode]: patch } });
 }
 
-const request = (mode: Mode, tool: Tool, args: Record<string, unknown>, workspace: string | null = "/ws") => ({
+const request = (
+  mode: Mode,
+  tool: Tool,
+  args: Record<string, unknown>,
+  workspace: string | null = "/ws",
+  extraRoots: readonly string[] = [],
+) => ({
   mode,
   tool,
   args,
   workspace,
+  extraRoots,
   conversationId: "c1",
   runId: "r1",
 });
@@ -133,6 +140,87 @@ describe("PermissionGate", () => {
     const gate = gateFor(settings);
     const bash = makeTool({ name: "bash", categories: ["bash"], execute: async () => ok("x") });
     expect(gate.check(request("code", bash, { command: "npm test" })).decision).toBe("allow");
+  });
+
+  /**
+   * Containment is enforced twice -- here and again in the Rust resolver -- and a
+   * folder the user added has to be honoured by both or it does not work at all.
+   * These cases exist because the gate is the layer that refuses first: getting it
+   * wrong produces a refusal pointing at the workspace while the folder is
+   * visibly listed in Settings.
+   */
+  describe("folders added under Settings", () => {
+    const gate = () => gateFor(withMode("code", { level: "bypass" }));
+
+    it("allows a path inside a folder the user added", () => {
+      const decision = gate().check(
+        request("code", makeTool(), { path: "/home/me/Code/a.ts" }, "/ws", ["/home/me/Code"]),
+      );
+      expect(decision.decision).toBe("allow");
+    });
+
+    it("still refuses a path inside no folder at all", () => {
+      const decision = gate().check(
+        request("code", makeTool(), { path: "/etc/passwd" }, "/ws", ["/home/me/Code"]),
+      );
+      expect(decision.decision).toBe("deny");
+      expect(decision.rule).toBe("outside_workspace");
+    });
+
+    it("names the folders that are open, so the user is told what to add", () => {
+      const decision = gate().check(
+        request("code", makeTool(), { path: "/home/me/Other/a.ts" }, "/ws", ["/home/me/Code"]),
+      );
+      expect(decision.reason).toContain("/ws");
+      expect(decision.reason).toContain("/home/me/Code");
+      expect(decision.reason).toMatch(/settings/i);
+    });
+
+    it("does not let a sibling folder sharing a name prefix slip through", () => {
+      // "/home/me/Code-secrets" starts with "/home/me/Code" as a string. A textual
+      // comparison would allow it; a path-segment comparison does not.
+      const decision = gate().check(
+        request("code", makeTool(), { path: "/home/me/Code-secrets/k" }, "/ws", ["/home/me/Code"]),
+      );
+      expect(decision.decision).toBe("deny");
+    });
+
+    it("keeps a parent escape refused even when a folder is added", () => {
+      const decision = gate().check(
+        request("code", makeTool(), { path: "../secrets" }, "/ws", ["/home/me/Code"]),
+      );
+      expect(decision.decision).toBe("deny");
+    });
+
+    it("allows a path when a folder is added but no workspace is open", () => {
+      // A user who has authorized a folder and closed the project can still work
+      // in it. Refusing here would make Settings look broken.
+      const decision = gate().check(
+        request("code", makeTool(), { path: "/home/me/Code/a.ts" }, null, ["/home/me/Code"]),
+      );
+      expect(decision.decision).toBe("allow");
+    });
+
+    it("refuses every path when nothing at all is open", () => {
+      // With no workspace and no added folders the gate has nothing to measure
+      // against, and the file tools report the same thing. Both refusing is
+      // correct; the tools get to say it in terms a user can act on.
+      const decision = gate().check(request("code", makeTool(), { path: "/home/me/a.ts" }, null));
+      expect(decision.decision).not.toBe("deny");
+    });
+
+    it("a denied path still wins over an allowed folder", () => {
+      // The user's own deny list is more specific than a folder grant, and must
+      // not be overridden by one.
+      const settings = SettingsSchema.parse({
+        permissions: { code: { level: "bypass", deniedPaths: ["/home/me/Code/private"] } },
+      });
+      const decision = gateFor(settings).check(
+        request("code", makeTool(), { path: "/home/me/Code/private/k" }, "/ws", ["/home/me/Code"]),
+      );
+      expect(decision.decision).toBe("deny");
+      expect(decision.rule).toBe("denied_path");
+    });
   });
 
   it("keeps tool paths inside the workspace", () => {

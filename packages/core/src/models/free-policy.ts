@@ -21,7 +21,7 @@
  *    try it, and offering a confirmation here would be a lie.
  */
 
-import { freenessFor } from "./freeness.js";
+import { freenessFor, type Freeness } from "./freeness.js";
 import type { ModelInfo } from "./provider.js";
 import type { ProviderDefinition } from "../providers/registry.js";
 import type { Usage } from "./types.js";
@@ -168,6 +168,31 @@ export function turnCost(
 }
 
 /**
+ * What a finished step's cost review concluded.
+ *
+ * A union, not a string, because "the run must stop" and "the user should read
+ * this" are different things and the UI treats them differently. A step that
+ * succeeded on a free model with no published price is a note; a step that was
+ * actually charged is a refusal.
+ */
+export type TurnCostReview =
+  | {
+      readonly ok: true;
+      readonly note?: string | undefined;
+      /**
+       * What this turn actually proved, for the session's observed-cost memory.
+       *
+       * Not merely "it was allowed". A turn whose price nobody could work out
+       * proved nothing about cost, and recording it as free is how a model
+       * Atomic has only ever *assumed* free ends up treated as known free for
+       * the rest of the session -- so the user stops being asked about it on the
+       * strength of an absence of evidence.
+       */
+      readonly observed?: ObservedCost | undefined;
+    }
+  | { readonly ok: false; readonly reason: string; readonly cost: number | null };
+
+/**
  * The check that runs after a turn, on the number the provider actually billed.
  *
  * Prices are published per million tokens and can be wrong, stale, or describe
@@ -182,36 +207,90 @@ export function reviewTurnCost(input: {
   readonly policy: FreePolicy;
   /** Charged by the provider for this turn, when it reports one. */
   readonly providerReportedCost?: number | undefined;
-}):
-  | { readonly ok: true }
-  | {
-      readonly ok: false;
-      readonly reason: string;
-      readonly cost: number | null;
-    } {
+  /**
+   * How the provider and catalog classify this model, when they could.
+   *
+   * Required for the "unpriced but known free" case, which is the whole point:
+   * many genuinely free models publish no per-token price at all, so "no price"
+   * and "no cost" are indistinguishable from the number alone. Without this the
+   * guard stopped a turn *after* it had already succeeded on a model the same
+   * policy had just allowed -- the user paid nothing, read a refusal, and had no
+   * way to tell those apart from a model that had charged them.
+   */
+  readonly freeness?: Freeness | undefined;
+}): TurnCostReview {
   const { model, usage, policy } = input;
-  const cost = input.providerReportedCost ?? turnCost(model, usage);
+  // Kept apart on purpose. One of these is a number a provider reported for
+  // this turn; the other is a published price multiplied by token counts. They
+  // are not the same kind of claim, and conflating them is what made the toggle
+  // for "free only" stop working.
+  const billed = input.providerReportedCost;
+  const estimated = billed ?? turnCost(model, usage);
 
-  if (cost === null) {
-    // Unpriced, and a free-only policy is in force. Nothing can be proven, so
-    // the honest answer is to ask rather than to wave it through.
-    if (policy.onlyFree) {
-      return {
-        ok: false,
-        cost: null,
-        reason: `Atomic cannot tell what ${model.name} costs, so the turn was stopped rather than assumed free.`,
-      };
-    }
-    return { ok: true };
-  }
-
-  if (policy.onlyFree && cost > 0) {
+  /*
+   * A reported charge is a fact, but a fact is not automatically a reason to
+   * stop. It stops the turn when either of two things is true:
+   *
+   *  - the free-only policy is on, in which case any cost at all is the thing
+   *    the user asked to be protected from; or
+   *  - the model was classified free or free-tier, in which case being charged
+   *    is a broken promise rather than a bill, and the user chose this model
+   *    *because* it was free.
+   *
+   * With the policy off and a model the user picked knowing it was paid, a
+   * charge is the expected outcome and the turn completes. Stopping there made
+   * paid models unreachable however the user configured them -- the same bug as
+   * the estimate branch below, reached by a different route.
+   */
+  const classifiedFree = input.freeness === "free" || input.freeness === "free-tier";
+  if (billed !== undefined && billed > 0 && (policy.onlyFree || classifiedFree)) {
     return {
       ok: false,
-      cost,
-      reason: `${model.name} cost $${cost.toFixed(4)} for that turn, so it is not free. The turn was stopped.`,
+      cost: billed,
+      reason: classifiedFree
+        ? `${model.name} is classified as free but reported a charge of $${billed.toFixed(4)} for that turn. The turn was stopped.`
+        : `${model.name} reported a charge of $${billed.toFixed(4)} for that turn. The turn was stopped because free-only is on.`,
     };
   }
 
-  return { ok: true };
+  /*
+   * A catalog price is a calculation, not an observation, so it is the policy's
+   * business rather than the guard's. This branch used to fire on any positive
+   * estimate, which quietly made the free-only toggle a no-op: the paid models
+   * it was supposed to allow could never run, and a user who had explicitly
+   * turned it off had no way to spend money on purpose.
+   */
+  if (estimated !== null && estimated > 0 && policy.onlyFree) {
+    return {
+      ok: false,
+      cost: estimated,
+      reason: `${model.name} cost about $${estimated.toFixed(4)} for that turn, so it is not free. The turn was stopped because free-only is on.`,
+    };
+  }
+
+  if (estimated === null) {
+    // Unpriced. A model the catalog and provider both call free is the common
+    // case and gets a note rather than a refusal: the user is told the price is
+    // unknown, and told the model is classified free, and the answer stays.
+    //
+    // An unclassified model gets no note at all. It was already asked about
+    // before the turn by `checkModelPolicy`, so the user has agreed to it once;
+    // announcing the same uncertainty again after a successful reply is noise,
+    // and the uncertainty is the reason they were asked.
+    if (policy.onlyFree && (input.freeness === "free" || input.freeness === "free-tier")) {
+      return {
+        ok: true,
+        note: `${model.name} does not publish a per-token price, so Atomic cannot price this turn. It is classified as free, and this turn reported no charge.`,
+        // No observation. "We could not price it" is not "it was free", and
+        // treating it as one means the next turn skips the question the user
+        // still has no basis to skip.
+        observed: undefined,
+      };
+    }
+    return { ok: true, observed: undefined };
+  }
+
+  // A number, and a zero one. That is the only thing that proves a model is
+  // free, so it is the only case that gets remembered.
+  return { ok: true, observed: estimated === 0 ? "free" : undefined };
 }

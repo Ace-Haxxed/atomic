@@ -8,6 +8,7 @@ import { ProviderError, type ProviderErrorKind } from "../providers/errors.js";
 import type { Provider, ModelRequest, StreamEvent } from "../models/provider.js";
 import { SettingsSchema } from "../settings/schema.js";
 import { EMPTY_USAGE, type FinishReason } from "../models/types.js";
+import type { TurnCostReview } from "../models/free-policy.js";
 
 /**
  * A provider that fails for a chosen set of models, so the fallback path can be
@@ -255,27 +256,57 @@ describe("model fallback", () => {
     expect(result.reason).toBe("error");
   });
 
-  it("sends a cross-provider fallback to that provider", async () => {
-    // A fallback id is not enough: the provider that is rate limiting us is not
-    // going to serve the next model either. The attempt has to land on the other
-    // provider's own log, or nothing has actually been recovered.
+  it("does not route to another provider on its own", async () => {
+    // Moving to another provider means another account, another key, another
+    // bill, and another party receiving the conversation. Atomic does that only
+    // when the user says so -- so the decisive assertion is that the other
+    // provider's log stays empty.
     const { result, routed } = await runOnce({
       primaryModel: "zen-busy",
       failModels: ["zen-busy"],
       extraProviders: [{ id: "openrouter", label: "OpenRouter" }],
       fallbackModels: [{ model: "or-calm", providerId: "openrouter", providerLabel: "OpenRouter" }],
     });
-    expect(result.reason).toBe("stop");
-    // The decisive assertion: the fallback was recorded on the *other*
-    // provider's log, which can only happen if the loop routed it there.
-    expect(routed["openrouter"]).toEqual(["or-calm"]);
-    expect(routed["zen"]).not.toContain("or-calm");
+    expect(result.reason).toBe("error");
+    // `routed` carries a key per configured provider, so the assertion is on
+    // what was *asked for* there, not on whether the key exists.
+    expect(routed["openrouter"]).toEqual([]);
+    expect(routed["zen"]).toEqual(["zen-busy"]);
   });
 
-  it("prefers a different provider over a better model on the failing one", async () => {
-    // Both are free and both would answer. Changing provider is what actually
-    // recovers a rate limit, so it wins regardless of rank.
-    const { routed } = await runOnce({
+  it("offers the other provider instead of using it", async () => {
+    const { events } = await runOnce({
+      primaryModel: "zen-busy",
+      failModels: ["zen-busy"],
+      extraProviders: [{ id: "openrouter", label: "OpenRouter" }],
+      fallbackModels: [{ model: "or-calm", providerId: "openrouter" }],
+    });
+    const offer = events.find((event) => event.type === "provider-switch-required");
+    expect(offer).toMatchObject({
+      from: "zen-busy",
+      to: "or-calm",
+      providerId: "openrouter",
+      providerLabel: "OpenRouter",
+    });
+  });
+
+  it("offers rather than errors, so the reply is not painted as a failure", async () => {
+    // The offer is reported once, with a button. Also reporting a run-error put
+    // a red banner above a question the user could still answer in one click.
+    const { events } = await runOnce({
+      primaryModel: "zen-busy",
+      failModels: ["zen-busy"],
+      extraProviders: [{ id: "openrouter", label: "OpenRouter" }],
+      fallbackModels: [{ model: "or-calm", providerId: "openrouter" }],
+    });
+    expect(events.some((event) => event.type === "run-error")).toBe(false);
+  });
+
+  it("finishes on this provider before ever offering another one", async () => {
+    // Both would answer, so the run is recoverable here and the question is not
+    // worth asking. Offering would train the user to click through a consent
+    // dialog for a switch Atomic did not need.
+    const { result, routed, events } = await runOnce({
       primaryModel: "zen-busy",
       failModels: ["zen-busy"],
       extraProviders: [{ id: "openrouter", label: "OpenRouter" }],
@@ -284,10 +315,9 @@ describe("model fallback", () => {
         { model: "or-calm", providerId: "openrouter" },
       ],
     });
-    expect(routed["openrouter"]).toEqual(["or-calm"]);
-    // "or-calm" never reached the failing provider, and "zen-other" was not
-    // tried first despite ranking higher.
-    expect(routed["zen"]).not.toContain("or-calm");
+    expect(result.reason).toBe("stop");
+    expect(routed["zen"]).toEqual(["zen-busy", "zen-other"]);
+    expect(events.some((event) => event.type === "provider-switch-required")).toBe(false);
   });
 
   it("falls back within the same provider when there is no other one", async () => {
@@ -336,19 +366,21 @@ describe("model fallback", () => {
     expect(attempts).toEqual(["a", "c"]);
   });
 
-  it("names the provider in the switch notice when the provider changed", async () => {
+  it("names the provider in the offer, not in a switch it did not make", async () => {
     const { events } = await runOnce({
       primaryModel: "zen-busy",
       failModels: ["zen-busy"],
       extraProviders: [{ id: "openrouter", label: "OpenRouter" }],
       fallbackModels: [{ model: "or-calm", providerId: "openrouter" }],
     });
-    const switchEvent = events.find((event) => event.type === "model-switch");
-    // Without this the notice reads identically for a Zen rate limit and an
-    // OpenRouter one, and the user cannot tell what changed.
-    expect(
-      switchEvent && switchEvent.type === "model-switch" ? switchEvent.providerLabel : null,
-    ).toBe("OpenRouter");
+    const offer = events.find((event) => event.type === "provider-switch-required");
+    // Without the label the offer reads identically for a Zen rate limit and an
+    // OpenRouter one, and the user cannot tell what they would be approving.
+    expect(offer && offer.type === "provider-switch-required" ? offer.providerLabel : null).toBe(
+      "OpenRouter",
+    );
+    // And nothing announced a switch, because none happened.
+    expect(events.some((event) => event.type === "model-switch")).toBe(false);
   });
 
   it("does not name a provider when only the model changed", async () => {
@@ -363,8 +395,8 @@ describe("model fallback", () => {
     ).toBeUndefined();
   });
 
-  it("caps cross-provider switches too", async () => {
-    const { result, routed } = await runOnce({
+  it("offers the first other provider and stops, rather than shopping between them", async () => {
+    const { result, routed, events } = await runOnce({
       primaryModel: "a",
       failAll: true,
       extraProviders: [
@@ -379,9 +411,17 @@ describe("model fallback", () => {
         { model: "m4", providerId: "p1" },
       ],
     });
-    // Primary plus at most two switches, however many providers are offered.
+    // One offer, one dead end. Walking the user's data through four providers
+    // looking for one that works is not a fallback, it is a campaign.
+    const offers = events.filter((event) => event.type === "provider-switch-required");
+    expect(offers).toHaveLength(1);
+    expect(offers[0]).toMatchObject({ to: "m1", providerId: "p1" });
     expect(result.reason).toBe("error");
-    expect(Object.values(routed).flat()).toHaveLength(3);
+    // Only the provider the run started on was ever asked for a model.
+    expect(routed["zen"]).toEqual(["a"]);
+    expect(routed["p1"]).toEqual([]);
+    expect(routed["p2"]).toEqual([]);
+    expect(routed["p3"]).toEqual([]);
   });
 
   it("uses the primary model when it works and no switch is announced", async () => {
@@ -439,7 +479,9 @@ describe("the free-only runtime guard", () => {
     return { provider, calls: () => calls };
   }
 
-  async function runGuarded(review: (input: { model: string }) => string | null) {
+  async function runGuarded(
+    review: (input: { model: string }) => TurnCostReview | null,
+  ) {
     const { provider, calls } = billingProvider({
       inputTokens: 1_000,
       outputTokens: 2_000,
@@ -469,7 +511,11 @@ describe("the free-only runtime guard", () => {
   }
 
   it("halts the run when the turn is found to have cost money", async () => {
-    const { result, events } = await runGuarded(() => "Paid Model cost $0.0330.");
+    const { result, events } = await runGuarded(() => ({
+      ok: false,
+      reason: "Paid Model cost $0.0330.",
+      cost: 0.033,
+    }));
     expect(result.reason).toBe("error");
     const failure = events.find((event) => event.type === "run-error");
     expect(failure).toMatchObject({ kind: "free-policy" });
@@ -480,7 +526,11 @@ describe("the free-only runtime guard", () => {
   });
 
   it("keeps the answer it already paid for", async () => {
-    const { result } = await runGuarded(() => "too expensive");
+    const { result } = await runGuarded(() => ({
+      ok: false,
+      reason: "too expensive",
+      cost: 1,
+    }));
     // Discarding a real answer over a pricing surprise would be a worse lie
     // than showing it with a warning attached.
     expect(result.messages.some((m) => m.role === "assistant")).toBe(true);
@@ -495,7 +545,9 @@ describe("the free-only runtime guard", () => {
 
   it("is told which model to judge", async () => {
     const { result } = await runGuarded(({ model }) =>
-      model === "paid-model" ? "that one costs money" : null,
+      model === "paid-model"
+        ? { ok: false, reason: "that one costs money", cost: 1 }
+        : null,
     );
     expect(result.reason).toBe("error");
   });
@@ -503,11 +555,32 @@ describe("the free-only runtime guard", () => {
   it("checks after the answer is saved, so nothing is lost to a race", async () => {
     // A guard that ran before the usage was known could not catch anything; one
     // that runs before the message is persisted would lose the message.
-    const { events } = await runGuarded(() => "too expensive");
+    const { events } = await runGuarded(() => ({
+      ok: false,
+      reason: "too expensive",
+      cost: 1,
+    }));
     const order = events.map((event) => event.type);
     expect(order).toContain("usage");
     expect(order.indexOf("usage")).toBeLessThan(order.indexOf("run-error"));
     expect(order).toContain("assistant-message");
+  });
+
+  /**
+   * The reason this is a union. A note means the run is fine and the user should
+   * read one quiet line; the old single-string contract could not say that, so
+   * an unpriced free model produced a run-error and a successful answer looked
+   * like a refusal.
+   */
+  it("emits a note and completes when the turn is fine but unpriced", async () => {
+    const { result, events } = await runGuarded(() => ({
+      ok: true,
+      note: "qwen3 does not publish a per-token price.",
+    }));
+    expect(result.reason).toBe("stop");
+    expect(events.some((event) => event.type === "run-error")).toBe(false);
+    const note = events.find((event) => event.type === "run-note");
+    expect(note).toMatchObject({ message: "qwen3 does not publish a per-token price." });
   });
 });
 

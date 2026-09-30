@@ -21,7 +21,12 @@ import { MODES, hasTools, isModeShipped } from "@atomic/core";
 
 import { Badge, Button, Input, Separator, cn } from "@atomic/ui";
 
-const MODE_LABELS: Readonly<Record<Mode, string>> = {
+/**
+ * Exported so error messages can name the mode in the same words the UI does.
+ * A second copy of these three strings would drift, and a message saying
+ * "cowork" where the sidebar says "Cowork" reads as a different mode.
+ */
+export const MODE_LABELS: Readonly<Record<Mode, string>> = {
   chat: "Chat",
   cowork: "Cowork",
   code: "Code",

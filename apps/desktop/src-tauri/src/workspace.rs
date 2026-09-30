@@ -31,8 +31,16 @@ pub enum ScopeError {
     NotAFile,
     /// Canonicalizing the path failed (permissions, broken symlink loop).
     Unresolvable(String),
-    /// The resolved path is outside the workspace.
-    OutsideWorkspace,
+    /// The resolved path is outside the workspace. Carries the root so the
+    /// message can name the folder that *is* open: telling a model "outside the
+    /// workspace" without saying which workspace leaves it nothing to repeat to
+    /// the user, and the fix -- open that folder -- needs to be nameable.
+    ///
+    /// Only the root is ever included, never the resolved path. The root is the
+    /// folder this conversation was opened on, so it is not a disclosure; the
+    /// resolved path is wherever the model was reaching, which may well be
+    /// somewhere the user never mentioned.
+    OutsideWorkspace(String),
     /// Symlink resolution landed outside the workspace.
     SymlinkEscape,
 }
@@ -50,9 +58,11 @@ impl ScopeError {
             }
             ScopeError::NotAFile => "That path is a directory, not a file.".to_string(),
             ScopeError::Unresolvable(why) => format!("The path could not be resolved: {why}"),
-            ScopeError::OutsideWorkspace => {
-                "That path is outside the workspace. Open the folder you want to work in first."
-                    .to_string()
+            ScopeError::OutsideWorkspace(root) => {
+                format!(
+                    "That path is outside the folder this conversation has open ({root}). \
+                     To work there, ask the user to open that folder as the project first."
+                )
             }
             ScopeError::SymlinkEscape => {
                 "That path resolves through a symlink to outside the workspace.".to_string()
@@ -130,7 +140,9 @@ impl Workspace {
             if self.exists_below_root(&joined) {
                 return Err(ScopeError::SymlinkEscape);
             }
-            return Err(ScopeError::OutsideWorkspace);
+            return Err(ScopeError::OutsideWorkspace(
+                self.canonical_root.display().to_string(),
+            ));
         }
 
         if must_exist && !resolved.exists() {
@@ -141,9 +153,64 @@ impl Workspace {
         Ok(resolved)
     }
 
-    /// Same as `resolve`, but refuses a directory.
-    pub fn resolve_file(&self, relative: &str) -> Result<PathBuf, ScopeError> {
-        let path = self.resolve(relative, true)?;
+    /// Resolve a path that may have been written out in full.
+    ///
+    /// A model asked to look in a folder will often write the whole path, either
+    /// because the user named one in their message or because it copied a path
+    /// out of earlier output. That is not an escape attempt, so it is not
+    /// refused on the grounds of being rooted -- it is held to exactly the same
+    /// containment check as a relative path and given the same answer.
+    ///
+    /// The distinction that matters is *who* chose the directory, not what the
+    /// path looks like. This method never widens what the workspace covers: a
+    /// rooted path is a different spelling of a location, not a new root. So
+    /// `resolve_input` can accept `/home/me/project/src` and refuse
+    /// `/home/me/.ssh` in exactly the same breath, and the guarantee the rest of
+    /// this module exists to make is unchanged.
+    ///
+    /// What it deliberately cannot do is adopt a new root. If the user wants
+    /// work done somewhere else, that folder is opened for the conversation, and
+    /// the same check then passes against it -- the user picks the sandbox, not
+    /// the model.
+    pub fn resolve_input(&self, input: &str, must_exist: bool) -> Result<PathBuf, ScopeError> {
+        let normalized = input.trim().replace('\\', "/");
+        if !looks_rooted(&normalized) {
+            return self.resolve(input, must_exist);
+        }
+
+        // Rooted, so there is nothing to join and no `..` to strip: the path is
+        // taken at face value and then checked, rather than being normalised into
+        // the root. Canonicalizing the deepest existing ancestor keeps the
+        // symlink case sound here too -- a symlinked parent inside the workspace
+        // cannot redirect an absolute path to somewhere outside it.
+        let candidate = Path::new(&normalized);
+
+        // Rooted on *some* platform but not on this one. `C:/Windows` is two
+        // ordinary components here, so treating it as a location would resolve
+        // it against the process directory and report a nonsensical answer about
+        // a path this machine cannot express. Refused as what it is: a model
+        // emitting a Windows path is confused, and `Rooted` says so.
+        if !candidate.is_absolute() {
+            return Err(ScopeError::Rooted);
+        }
+        let resolved = self.canonicalize_deepest_existing(candidate)?;
+
+        if !is_within(&self.canonical_root, &resolved) {
+            return Err(ScopeError::OutsideWorkspace(
+                self.canonical_root.display().to_string(),
+            ));
+        }
+        if must_exist && !resolved.exists() {
+            return Err(ScopeError::Unresolvable(
+                "no such file in the workspace".to_string(),
+            ));
+        }
+        Ok(resolved)
+    }
+
+    /// Same as `resolve_input`, but refuses a directory.
+    pub fn resolve_file(&self, input: &str) -> Result<PathBuf, ScopeError> {
+        let path = self.resolve_input(input, true)?;
         if path.is_dir() {
             return Err(ScopeError::NotAFile);
         }
@@ -288,13 +355,61 @@ mod tests {
     }
 
     #[test]
-    fn rejects_an_absolute_path() {
+    fn rejects_an_absolute_path_outside_the_workspace() {
+        // No longer refused for being rooted: it is held to the same containment
+        // rule as everything else, and this is what that rule says.
         let root = scratch("absolute");
         let ws = Workspace::new(&root).unwrap();
-        assert_eq!(
+        assert!(matches!(
             ws.resolve_file("/etc/passwd").unwrap_err(),
-            ScopeError::Rooted
+            ScopeError::OutsideWorkspace(_)
+        ));
+    }
+
+    #[test]
+    fn accepts_an_absolute_path_inside_the_workspace() {
+        // The case this exists for: the user says "look in
+        // /home/me/project/src" and the model writes that in full. Same file, same
+        // containment, spelled absolutely.
+        let root = scratch("absolute-inside");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/a.txt"), "hi").unwrap();
+        let ws = Workspace::new(&root).unwrap();
+        assert_eq!(
+            ws.resolve_file(root.join("src/a.txt").to_str().unwrap())
+                .unwrap(),
+            root.join("src/a.txt")
         );
+    }
+
+    #[test]
+    fn accepts_an_absolute_directory_path_for_listing() {
+        let root = scratch("absolute-dir");
+        fs::create_dir_all(root.join("src")).unwrap();
+        let ws = Workspace::new(&root).unwrap();
+        let resolved = ws
+            .resolve_input(root.join("src").to_str().unwrap(), true)
+            .unwrap();
+        assert!(resolved.is_dir());
+    }
+
+    #[test]
+    fn an_absolute_path_cannot_escape_via_a_symlinked_parent() {
+        // The reason the deepest existing ancestor is canonicalized rather than
+        // the leaf: a link inside the workspace must not turn an absolute write
+        // into a write outside it.
+        let root = scratch("absolute-symlink");
+        let outside = scratch("absolute-symlink-outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), "secret").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        let ws = Workspace::new(&root).unwrap();
+        let via_link = root.join("link/secret.txt");
+        assert!(matches!(
+            ws.resolve_file(via_link.to_str().unwrap()).unwrap_err(),
+            ScopeError::SymlinkEscape | ScopeError::OutsideWorkspace(_)
+        ));
     }
 
     #[test]
@@ -338,7 +453,7 @@ mod tests {
         let error = ws.resolve_file("../app-secrets/key.txt").unwrap_err();
         assert!(matches!(
             error,
-            ScopeError::ParentEscape | ScopeError::OutsideWorkspace
+            ScopeError::ParentEscape | ScopeError::OutsideWorkspace(_)
         ));
     }
 
@@ -429,7 +544,7 @@ mod tests {
             ScopeError::ParentEscape,
             ScopeError::Rooted,
             ScopeError::NotAFile,
-            ScopeError::OutsideWorkspace,
+            ScopeError::OutsideWorkspace("/tmp/root".into()),
             ScopeError::SymlinkEscape,
             ScopeError::Unresolvable("x".into()),
         ] {

@@ -9,25 +9,48 @@
  * a fact the tool verified.
  */
 
+import { authorizedRoots } from "../settings/roots.js";
 import { z } from "zod";
 import type { Tool, ToolContext, ToolResult } from "./registry.js";
 import type { CheckpointPort, FileSystemPort } from "../host/ports.js";
 import type { Settings } from "../settings/schema.js";
 
-function requireWorkspace(context: ToolContext): string {
-  if (!context.workspace) {
-    throw new Error("This conversation has no folder open. Ask the user to open a project folder first.");
+/**
+ * Every folder this conversation may read or write, in the order they should be
+ * tried: the open workspace first, then the folders the user added in Settings.
+ *
+ * Having no workspace is not automatically fatal. A user who has added a folder
+ * and has no project open can still work in that folder, and refusing here would
+ * make Settings look broken -- the folder is listed, it is authorized, and the
+ * only reason it is unreachable is that some *other* folder happens to be closed.
+ *
+ * The message for the genuinely empty case names the fix, because "no folder
+ * open" on its own is a dead end for a model that has no way to open one.
+ */
+function requireRoots(context: ToolContext): readonly string[] {
+  const roots = authorizedRoots(context.workspace, context.extraRoots);
+  if (roots.length === 0) {
+    throw new Error(
+      "This conversation has no folder open, and no folders have been allowed. " +
+        "Ask the user to open a project folder, or to add one under Settings > Files.",
+    );
   }
-  return context.workspace;
+  return roots;
 }
 
 const WriteArgs = z.object({
-  path: z.string().min(1).describe("Workspace-relative path. Parent folders are created."),
+  path: z
+    .string()
+    .min(1)
+    .describe("Path to the file. Relative to the open folder, or absolute inside it. Parent folders are created."),
   content: z.string().describe("The full new contents of the file."),
 });
 
 const EditArgs = z.object({
-  path: z.string().min(1).describe("Workspace-relative path of the file to edit."),
+  path: z
+    .string()
+    .min(1)
+    .describe("Path of the file to edit. Relative to the open folder, or absolute inside it."),
   old_string: z
     .string()
     .min(1)
@@ -67,11 +90,11 @@ export function createWriteTools(fs: FileSystemPort, checkpointDeps?: Checkpoint
    * collapses "no backup needed" and "the backup failed" into the same value,
    * and only one of those is something the user must be shown.
    */
-  async function capture(context: ToolContext, root: string, path: string): Promise<string | null> {
+  async function capture(context: ToolContext, roots: readonly string[], path: string): Promise<string | null> {
     const deps = checkpointDeps;
     if (!deps?.checkpoints || deps.settings().checkpointsEnabled !== true) return null;
     const existed = await fs
-      .readFile(root, path)
+      .readFile(roots, path)
       .then((file) => ({ existed: true, before: file.content }))
       .catch(() => ({ existed: false, before: "" }));
     try {
@@ -98,7 +121,10 @@ export function createWriteTools(fs: FileSystemPort, checkpointDeps?: Checkpoint
     parameters: {
       type: "object",
       properties: {
-        path: { type: "string", description: "Workspace-relative path." },
+        path: {
+          type: "string",
+          description: "Path to the file. Relative to the open folder, or absolute inside it.",
+        },
         content: { type: "string", description: "Full new contents." },
       },
       required: ["path", "content"],
@@ -108,13 +134,13 @@ export function createWriteTools(fs: FileSystemPort, checkpointDeps?: Checkpoint
     modes: ["code", "cowork"],
     parse: (args) => WriteArgs.parse(args),
     async execute(args, context): Promise<ToolResult> {
-      const root = requireWorkspace(context);
+      const roots = requireRoots(context);
       const existing = await fs
-        .readFile(root, args.path, { limit: 1 })
+        .readFile(roots, args.path, { limit: 1 })
         .then(() => true)
         .catch(() => false);
-      const backupWarning = await capture(context, root, args.path);
-      const entry = await fs.writeFile(root, args.path, args.content);
+      const backupWarning = await capture(context, roots, args.path);
+      const entry = await fs.writeFile(roots, args.path, args.content);
       const verb = existing ? "Replaced" : "Created";
       return {
         content:
@@ -138,7 +164,10 @@ export function createWriteTools(fs: FileSystemPort, checkpointDeps?: Checkpoint
     parameters: {
       type: "object",
       properties: {
-        path: { type: "string", description: "Workspace-relative path." },
+        path: {
+          type: "string",
+          description: "Path to the file. Relative to the open folder, or absolute inside it.",
+        },
         old_string: { type: "string", description: "Exact text to replace." },
         new_string: { type: "string", description: "Replacement text." },
         replace_all: { type: "boolean", description: "Replace every occurrence." },
@@ -150,8 +179,8 @@ export function createWriteTools(fs: FileSystemPort, checkpointDeps?: Checkpoint
     modes: ["code", "cowork"],
     parse: (args) => EditArgs.parse(args),
     async execute(args, context): Promise<ToolResult> {
-      const root = requireWorkspace(context);
-      const current = await fs.readFile(root, args.path);
+      const roots = requireRoots(context);
+      const current = await fs.readFile(roots, args.path);
       if (current.truncated) {
         throw new Error(
           `${args.path} is too large to edit safely (${current.totalLines} lines). Use write_file with the full contents, or edit a smaller file.`,
@@ -176,8 +205,8 @@ export function createWriteTools(fs: FileSystemPort, checkpointDeps?: Checkpoint
         ? current.content.split(args.old_string).join(args.new_string)
         : current.content.replace(args.old_string, args.new_string);
 
-      const backupWarning = await capture(context, root, args.path);
-      await fs.writeFile(root, args.path, updated);
+      const backupWarning = await capture(context, roots, args.path);
+      await fs.writeFile(roots, args.path, updated);
       const replaced = args.replace_all ? occurrences : 1;
 
       return {

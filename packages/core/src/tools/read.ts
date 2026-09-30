@@ -8,6 +8,7 @@
  * model to guess, and a model that guesses edits the wrong file.
  */
 
+import { authorizedRoots } from "../settings/roots.js";
 import { z } from "zod";
 import type { Tool, ToolContext, ToolResult } from "./registry.js";
 import type { FileSystemPort } from "../host/ports.js";
@@ -16,21 +17,41 @@ import type { FileSystemPort } from "../host/ports.js";
  * Refuse early when the mode has no workspace, with a message the model can act
  * on. Every file tool needs this and none should invent its own wording.
  */
-function requireWorkspace(context: ToolContext): string {
-  if (!context.workspace) {
-    throw new Error("This conversation has no folder open. Ask the user to open a project folder first.");
+/**
+ * Every folder this conversation may read or write, in the order they should be
+ * tried: the open workspace first, then the folders the user added in Settings.
+ *
+ * Having no workspace is not automatically fatal. A user who has added a folder
+ * and has no project open can still work in that folder, and refusing here would
+ * make Settings look broken -- the folder is listed, it is authorized, and the
+ * only reason it is unreachable is that some *other* folder happens to be closed.
+ *
+ * The message for the genuinely empty case names the fix, because "no folder
+ * open" on its own is a dead end for a model that has no way to open one.
+ */
+function requireRoots(context: ToolContext): readonly string[] {
+  const roots = authorizedRoots(context.workspace, context.extraRoots);
+  if (roots.length === 0) {
+    throw new Error(
+      "This conversation has no folder open, and no folders have been allowed. " +
+        "Ask the user to open a project folder, or to add one under Settings > Files.",
+    );
   }
-  return context.workspace;
+  return roots;
 }
 
 const ReadArgs = z.object({
-  path: z.string().min(1).describe("Workspace-relative path, e.g. src/app.ts"),
+  path: z.string().min(1).describe("Path to the file, e.g. src/app.ts. Relative to the open folder, or absolute inside it."),
   offset: z.number().int().min(1).optional().describe("1-based first line to return."),
   limit: z.number().int().min(1).max(2000).optional().describe("How many lines to return."),
 });
 
 const ListArgs = z.object({
-  path: z.string().min(1).default(".").describe("Workspace-relative directory. Defaults to the root."),
+  path: z
+    .string()
+    .min(1)
+    .default(".")
+    .describe("Directory to list. Relative to the open folder, or absolute inside it. Defaults to the root."),
 });
 
 const GlobArgs = z.object({
@@ -55,7 +76,10 @@ export function createReadTools(fs: FileSystemPort): Tool<any>[] {
     parameters: {
       type: "object",
       properties: {
-        path: { type: "string", description: "Workspace-relative path." },
+        path: {
+          type: "string",
+          description: "Path to the file. Relative to the open folder, or absolute inside it.",
+        },
         offset: { type: "integer", description: "1-based first line to return." },
         limit: { type: "integer", description: "How many lines to return." },
       },
@@ -66,8 +90,8 @@ export function createReadTools(fs: FileSystemPort): Tool<any>[] {
     modes: ["code", "cowork"],
     parse: (args) => ReadArgs.parse(args),
     async execute(args, context): Promise<ToolResult> {
-      const root = requireWorkspace(context);
-      const result = await fs.readFile(root, args.path, {
+      const roots = requireRoots(context);
+      const result = await fs.readFile(roots, args.path, {
         ...(args.offset !== undefined ? { offset: args.offset } : {}),
         ...(args.limit !== undefined ? { limit: args.limit } : {}),
       });
@@ -87,11 +111,15 @@ export function createReadTools(fs: FileSystemPort): Tool<any>[] {
   const listFiles: Tool<z.infer<typeof ListArgs>> = {
     name: "list_files",
     description:
-      "List the files and folders in a directory. Directories come first. Generated folders such as node_modules and .git are left out.",
+      "List the files and folders in a directory. Directories come first. Generated folders such as node_modules and .git are left out. Accepts a full path as well as one relative to the open folder, so a directory the user names by hand works without rewriting it.",
     parameters: {
       type: "object",
       properties: {
-        path: { type: "string", description: 'Workspace-relative directory. Use "." for the root.' },
+        path: {
+          type: "string",
+          description:
+            'Directory to list. Relative to the open folder, or absolute inside it. Use "." for the root.',
+        },
       },
       additionalProperties: false,
     },
@@ -99,8 +127,8 @@ export function createReadTools(fs: FileSystemPort): Tool<any>[] {
     modes: ["code", "cowork"],
     parse: (args) => ListArgs.parse(args),
     async execute(args, context): Promise<ToolResult> {
-      const root = requireWorkspace(context);
-      const { entries, truncated } = await fs.listDirectory(root, args.path);
+      const roots = requireRoots(context);
+      const { entries, truncated } = await fs.listDirectory(roots, args.path);
       if (entries.length === 0) return { content: `${args.path} is empty.` };
       const lines = entries.map((entry) =>
         entry.isDir ? `${entry.path}/` : `${entry.path}  (${entry.size} bytes)`,
@@ -125,8 +153,8 @@ export function createReadTools(fs: FileSystemPort): Tool<any>[] {
     modes: ["code", "cowork"],
     parse: (args) => GlobArgs.parse(args),
     async execute(args, context): Promise<ToolResult> {
-      const root = requireWorkspace(context);
-      const matches = await fs.glob(root, args.pattern);
+      const roots = requireRoots(context);
+      const matches = await fs.glob(roots, args.pattern);
       if (matches.length === 0) {
         // Naming the pattern back makes a typo obvious; "no results" alone
         // reads identically to a genuinely absent file.
@@ -155,8 +183,8 @@ export function createReadTools(fs: FileSystemPort): Tool<any>[] {
     modes: ["code", "cowork"],
     parse: (args) => GrepArgs.parse(args),
     async execute(args, context): Promise<ToolResult> {
-      const root = requireWorkspace(context);
-      const result = await fs.grep(root, args.pattern, {
+      const roots = requireRoots(context);
+      const result = await fs.grep(roots, args.pattern, {
         caseSensitive: args.case_sensitive,
         ...(args.glob ? { glob: args.glob } : {}),
         maxMatches: args.max_matches,

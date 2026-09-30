@@ -111,10 +111,58 @@ describe("a provider change mid-run", () => {
         pendingApproval={false}
         error={null}
         usage={{ inputTokens: 0, outputTokens: 0, totalTokens: 0 }}
-        notice="Switched to local-qwen on Ollama because it hit a rate limit."
+        notices={["Switched to local-qwen on Ollama because it hit a rate limit."]}
       />,
     );
     expect(markup).toContain("Switched to local-qwen on Ollama");
+  });
+
+  /**
+   * A run can switch provider *and* land on a model that publishes no price.
+   * One slot for both meant whichever event arrived second erased the first, so
+   * the switch stopped being reported the moment notes were possible.
+   */
+  it("shows a switch and a note at the same time", () => {
+    const markup = renderToStaticMarkup(
+      <MessageList
+        messages={[]}
+        liveText=""
+        liveReasoning=""
+        tools={[]}
+        streaming={false}
+        pendingApproval={false}
+        error={null}
+        usage={{ inputTokens: 0, outputTokens: 0, totalTokens: 0 }}
+        notices={[
+          "Switched to local-qwen on Ollama because it hit a rate limit.",
+          "local-qwen does not publish a per-token price, so Atomic cannot price this turn.",
+        ]}
+      />,
+    );
+    expect(markup).toContain("Switched to local-qwen on Ollama");
+    expect(markup).toContain("does not publish a per-token price");
+  });
+
+  /**
+   * The old behaviour painted this in the error slot, so a successful answer
+   * turned red and read as a refusal the user had to retry.
+   */
+  it("does not present a note as an error", () => {
+    const markup = renderToStaticMarkup(
+      <MessageList
+        messages={[]}
+        liveText="Here is your answer."
+        liveReasoning=""
+        tools={[]}
+        streaming={true}
+        pendingApproval={false}
+        error={null}
+        usage={{ inputTokens: 0, outputTokens: 0, totalTokens: 0 }}
+        notices={["local-qwen does not publish a per-token price."]}
+      />,
+    );
+    expect(markup).toContain("Here is your answer.");
+    expect(markup).not.toContain("text-destructive");
   });
 });
 

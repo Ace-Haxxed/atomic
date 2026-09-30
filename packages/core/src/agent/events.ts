@@ -21,6 +21,33 @@ export type AgentEvent =
   | { readonly type: "usage"; readonly runId: string; readonly usage: Usage; readonly model: string }
   | { readonly type: "compacted"; readonly runId: string; readonly removedMessages: number; readonly freedTokens: number }
   | { readonly type: "run-error"; readonly runId: string; readonly message: string; readonly userMessage: string; readonly kind: string }
+  /**
+   * The run stopped because the answer now needs a different provider, and
+   * Atomic will not move it there on its own.
+   *
+   * Carries the model and provider so the UI can offer the one thing that
+   * actually helps: a button that retries the user's own message against the
+   * provider they approve. Until they press it, the run is over -- the reply is
+   * not retried anywhere behind their back.
+   */
+  | {
+      readonly type: "provider-switch-required";
+      readonly runId: string;
+      readonly from: string;
+      readonly to: string;
+      readonly providerId: string;
+      readonly providerLabel: string;
+      readonly reason: string;
+    }
+  /**
+   * Something the run wants the user to know that is not a failure.
+   *
+   * Separate from `run-error` because a free model that publishes no price is
+   * worth one quiet line and must not be painted as a refusal -- the answer is
+   * already on screen and nothing went wrong. Anything that went wrong is still a
+   * `run-error`.
+   */
+  | { readonly type: "run-note"; readonly runId: string; readonly message: string }
   /** A runtime fallback swapped models mid-turn; the UI shows a one-line notice. */
   | {
       readonly type: "model-switch";

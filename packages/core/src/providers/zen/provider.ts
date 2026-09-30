@@ -15,6 +15,11 @@ import {
   toProviderError,
 } from "../errors.js";
 import { HttpClient, assertOk, redactUrl } from "../http.js";
+import type { CatalogSource } from "../registry.js";
+import {
+  fetchGeminiNativeModels,
+  type GeminiNativeModel,
+} from "../gemini/native-models.js";
 import type {
   CredentialCheck,
   ModelCatalog,
@@ -77,6 +82,7 @@ import {
   isAtomicGated,
   markSuspect,
   markReachable,
+  wouldBlock,
   type AtomicAvailability,
 } from "./atomic-availability.js";
 import type { Database } from "../../storage/database.js";
@@ -85,14 +91,42 @@ import type { Database } from "../../storage/database.js";
 const CATALOG_TTL_MS = 6 * 60 * 60 * 1000;
 const MODELS_DEV_TTL_MS = 24 * 60 * 60 * 1000;
 
-const CATALOG_CACHE_KEY = "zen.catalog";
-const MODELS_DEV_CACHE_KEY = "zen.modelsdev";
+/**
+ * Cache keys are scoped to the provider they were fetched for.
+ *
+ * These used to be the bare literals `"zen.catalog"`, `"zen.modelsdev"` and
+ * friends, written into `model_cache.provider_id` -- the column whose name
+ * promises per-provider separation. Every hosted provider in this app is served
+ * by *this* class, so OpenRouter's list, Gemini's 404 and Zen's own catalog all
+ * landed on the same row and whichever provider refreshed last won. That is why
+ * Gemini could show a foreign provider's models: it was not reading Gemini at
+ * all, it was reading the row the last provider wrote.
+ *
+ * The base URL is part of the key as well as the id, because a user can point a
+ * provider at a different endpoint and the two lists are genuinely different.
+ */
+export function providerCacheKey(
+  kind: string,
+  providerId: string,
+  baseUrl: string,
+): string {
+  return `zen.${kind}@${providerId}@${trimSlash(baseUrl)}`;
+}
 
-/** Second-priority pricing signal: Zen's own published table. */
-const PUBLISHED_PRICING_CACHE_KEY = "zen.publishedpricing";
-
-/** What Atomic has learned from real calls about which models it can reach. */
-const AVAILABILITY_CACHE_KEY = "zen.atomicavailability";
+/**
+ * Cache keys written before the scope existed, which are ambiguous by
+ * construction and therefore cannot be attributed to any provider.
+ *
+ * Discarded on first read rather than migrated: a migration would have to guess
+ * which provider wrote each row, and guessing wrong is the same bug with extra
+ * steps. A refetch is cheap and the alternative is a permanent wrong list.
+ */
+const UNSCOPED_CACHE_KEYS: readonly string[] = [
+  "zen.catalog",
+  "zen.modelsdev",
+  "zen.publishedpricing",
+  "zen.atomicavailability",
+];
 
 /**
  * How many models to try before giving up on the probe.
@@ -110,6 +144,17 @@ const MAX_PROBE_CANDIDATES = 4;
  */
 const PUBLISHED_PRICING_TTL_MS = 24 * 60 * 60 * 1000;
 
+/**
+ * How long a model gets to prove it is reachable before being written off.
+ *
+ * Short on purpose. This runs inside the failure path of a request the user is
+ * already waiting on, so its cost is paid by that request; a probe that ran to
+ * the provider's full timeout would double the wait before showing the same
+ * error. One token is asked for, so anything under a couple of seconds means
+ * something is wrong with the connection rather than the model being slow.
+ */
+const PROBE_TIMEOUT_MS = 4_000;
+
 export interface ZenProviderDeps {
   /**
    * How to route a model id this provider serves.
@@ -126,6 +171,22 @@ export interface ZenProviderDeps {
   readonly hasRoutingTable?: boolean | undefined;
   readonly db?: Database | undefined;
   readonly fetch?: typeof fetch | undefined;
+  /**
+   * The registry id this instance serves.
+   *
+   * Used for the provider identity the app records and for cache scoping. Defaults
+   * to Zen because that is what this class is; every other caller names itself.
+   */
+  readonly providerId?: string | undefined;
+  /** Human label for messages this provider raises. Defaults to Zen's. */
+  readonly label?: string | undefined;
+  /**
+   * Where to read the model list from, when `<baseUrl>/models` is not the answer.
+   *
+   * See `registry.ts`: Gemini's OpenAI-compatibility surface has no listing
+   * endpoint, so appending `/models` to it 404s for every key.
+   */
+  readonly catalogSource?: CatalogSource | null;
   /**
    * Retry policy for retryable responses.
    *
@@ -145,8 +206,19 @@ export interface ZenProviderDeps {
 }
 
 export class ZenProvider implements Provider {
-  readonly id = ZEN_PROVIDER_ID;
-  readonly name = "OpenCode Zen";
+  /**
+   * Which provider this instance speaks for.
+   *
+   * This was a hard-coded `opencode-zen`, because until now this class only ever
+   * served Zen. It is now the implementation behind every hosted provider, which
+   * made that constant actively wrong: an assistant message from Gemini was
+   * recorded as `providerId: "opencode-zen"`, the cost guard looked up Zen's
+   * pricing for an OpenRouter run, and a fallback candidate claimed to be Zen.
+   * The id is what the rest of the app uses to decide who a request belongs to,
+   * so it has to be the provider that will actually answer it.
+   */
+  readonly id: string;
+  readonly name: string;
   readonly baseUrl: string;
 
   /** Where to list models. Defaults to `<baseUrl>/models`. */
@@ -174,12 +246,32 @@ export class ZenProvider implements Provider {
   #modelsDev: { provider: unknown; fetchedAt: number } | undefined;
   #availability: AtomicAvailability = EMPTY_AVAILABILITY;
 
+  /**
+   * This instance's cache keys.
+   *
+   * Derived from the provider identity and the endpoint, so two providers
+   * sharing this implementation can never read each other's rows.
+   */
+  readonly #catalogKey: string;
+  readonly #modelsDevKey: string;
+  readonly #pricingKey: string;
+  readonly #availabilityKey: string;
+  #unscopedCacheDiscarded = false;
+  #catalogSource: CatalogSource | null;
+
   constructor(credentials: ProviderCredentials, deps: ZenProviderDeps = {}) {
+    this.id = deps.providerId ?? ZEN_PROVIDER_ID;
+    this.name = deps.label ?? (this.id === ZEN_PROVIDER_ID ? "OpenCode Zen" : this.id);
     this.baseUrl = trimSlash(credentials.baseUrl?.trim() || ZEN_BASE_URL);
     // The catalog endpoint follows the base URL. Hard-coding Zen's made the
     // provider unusable for anyone else's key, which is the whole point of
     // letting a pasted key pick the provider.
     this.#modelsUrl = `${this.baseUrl}/models`;
+    this.#catalogKey = providerCacheKey("catalog", this.id, this.baseUrl);
+    this.#modelsDevKey = providerCacheKey("modelsdev", this.id, this.baseUrl);
+    this.#pricingKey = providerCacheKey("publishedpricing", this.id, this.baseUrl);
+    this.#availabilityKey = providerCacheKey("atomicavailability", this.id, this.baseUrl);
+    this.#catalogSource = deps.catalogSource ?? null;
     this.#defaultWireFormat = deps.defaultWireFormat ?? "openai-chat";
     this.#hasRoutingTable = deps.hasRoutingTable ?? true;
     this.#apiKey = resolveApiKey(credentials.apiKey, deps.env, this.name);
@@ -247,7 +339,7 @@ export class ZenProvider implements Provider {
     // A forced refresh is the user asking to check the world again, which
     // includes re-testing the models we had written off.
     await this.#loadAvailability(force);
-    const cached = await this.#readCache<ModelCatalog>(CATALOG_CACHE_KEY);
+    const cached = await this.#readCache<ModelCatalog>(this.#catalogKey);
     if (!force && cached && this.#now() - cached.fetchedAt < CATALOG_TTL_MS) {
       // Served from SQLite, so reported as a cache read. It is not `stale`: it is
       // within its TTL, and `fetchedAt` is what the UI shows as "last refreshed".
@@ -260,21 +352,36 @@ export class ZenProvider implements Provider {
     }
 
     try {
-      const ids = await this.#fetchModelIds(signal);
+      // A provider whose own listing carries the facts returns them alongside the
+      // ids. Dropping them and keeping only the ids is how Google's models ended
+      // up with Zen's token limits and Zen's freeness: the picker described
+      // models this provider has never heard of.
+      const listed = await this.#fetchModelList(signal);
       const metadata = await this.#fetchModelsDev(signal);
       const published = await this.#fetchPublishedPricing(signal);
-      const models = ids
-        .filter((id) => !isNonChatModel(id))
-        .map((id) => {
-          const npm = metadata?.models?.[id]?.npm;
-          const wireFormat = this.#routeWireFormat(id, npm);
-          const modelMetadata = readModelMetadata(
-            metadata?.provider,
+      const models = listed
+        .filter((entry) => !isNonChatModel(entry.id))
+        .map((entry) => {
+          const id = entry.id;
+          // The provider's own listing is authoritative about the provider's
+          // models. A third-party catalog is only consulted for what the
+          // provider did not state.
+          const wireFormat = this.#routeWireFormat(
             id,
-            wireFormat,
+            metadata?.models?.[id]?.npm,
           );
+          const modelMetadata = entry.native
+            ? nativeModelMetadata(entry.native)
+            : readModelMetadata(metadata?.provider, id, wireFormat);
           const info = buildModelInfo(id, wireFormat, modelMetadata);
-          const priced = this.#publishedPriceFor(published, info.name, id);
+          // Only a provider that actually publishes prices gets priced from a
+          // third-party price list. Attributing Zen's or OpenCode's rates to a
+          // Google model would make the free-only switch judge the wrong
+          // account's billing.
+          const priced =
+            !entry.native && this.#catalogSource !== "native-gemini"
+              ? this.#publishedPriceFor(published, info.name, id)
+              : undefined;
           return priced ? { ...info, publishedPricing: priced } : info;
         });
       // What Zen serves, kept separate from what Atomic has learned about it.
@@ -285,7 +392,7 @@ export class ZenProvider implements Provider {
         fetchedAt: this.#now(),
         source: "api",
       };
-      await this.#writeCache(CATALOG_CACHE_KEY, catalog);
+      await this.#writeCache(this.#catalogKey, catalog);
       return { ...catalog, models: this.#stamp(catalog.models) };
     } catch (error) {
       // A stale cache is better than nothing, but say so.
@@ -319,7 +426,16 @@ export class ZenProvider implements Provider {
     }
   }
 
-  async #fetchModelIds(signal?: AbortSignal): Promise<string[]> {
+  async #fetchModelList(signal?: AbortSignal): Promise<ListedModel[]> {
+    if (this.#catalogSource === "native-gemini") {
+      return (
+        await fetchGeminiNativeModels(
+          (url, sig) => this.#http.request({ url, signal: sig, retries: 2 }, this.id),
+          this.id,
+          signal,
+        )
+      ).map((native) => ({ id: native.id, native }));
+    }
     const response = await this.#http.request(
       { url: this.#modelsUrl, signal, retries: 2 },
       this.id,
@@ -340,7 +456,7 @@ export class ZenProvider implements Provider {
         "empty_catalog",
         "No models returned",
       );
-    return ids;
+    return ids.map((id) => ({ id }));
   }
 
   async #fetchModelsDev(
@@ -349,14 +465,14 @@ export class ZenProvider implements Provider {
     const cached = await this.#readCache<{
       provider: unknown;
       fetchedAt: number;
-    }>(MODELS_DEV_CACHE_KEY);
+    }>(this.#modelsDevKey);
     const payload =
       cached && this.#now() - cached.fetchedAt < MODELS_DEV_TTL_MS
         ? cached
         : undefined;
     const source = payload?.provider ?? (await this.#tryFetchModelsDev(signal));
     if (!source) return undefined;
-    await this.#writeCache(MODELS_DEV_CACHE_KEY, {
+    await this.#writeCache(this.#modelsDevKey, {
       provider: source,
       fetchedAt: this.#now(),
     });
@@ -380,12 +496,12 @@ export class ZenProvider implements Provider {
       // a refresh look like it worked right up until the next launch, which
       // then resurrected exactly the model the user just asked to try again --
       // and the retry would fail for a reason that is now invisible.
-      await this.#deleteCache(AVAILABILITY_CACHE_KEY);
+      await this.#deleteCache(this.#availabilityKey);
       return;
     }
     if (this.#availability !== EMPTY_AVAILABILITY) return;
     const cached = await this.#readCache<AtomicAvailability>(
-      AVAILABILITY_CACHE_KEY,
+      this.#availabilityKey,
     );
     // Normalised on read, not trusted as-is. The `suspect` map was added after
     // rows were already being written, and a row without it would be adopted
@@ -411,7 +527,7 @@ export class ZenProvider implements Provider {
   async #observe(next: AtomicAvailability): Promise<void> {
     this.#availability = next;
     this.#catalog = undefined;
-    await this.#writeCache(AVAILABILITY_CACHE_KEY, next);
+    await this.#writeCache(this.#availabilityKey, next);
   }
 
   /**
@@ -424,6 +540,7 @@ export class ZenProvider implements Provider {
   async #record(
     modelId: string,
     outcome: { refused: string } | { reachable: true },
+    options: { readonly confirm?: boolean } = {},
   ): Promise<void> {
     const current = this.#availability;
     const next =
@@ -433,6 +550,7 @@ export class ZenProvider implements Provider {
             modelId,
             outcome.refused,
             new Date(this.#now()).toISOString(),
+            options,
           )
         : markReachable(current, modelId);
     if (next === current) return;
@@ -458,7 +576,7 @@ export class ZenProvider implements Provider {
         { free: boolean; input?: number; output?: number }
       >;
       fetchedAt: number;
-    }>(PUBLISHED_PRICING_CACHE_KEY);
+    }>(this.#pricingKey);
     const fresh =
       cached && this.#now() - cached.fetchedAt < PUBLISHED_PRICING_TTL_MS;
     if (fresh) return new Map(Object.entries(cached!.prices));
@@ -466,7 +584,7 @@ export class ZenProvider implements Provider {
     const parsed = await this.#tryFetchPublishedPricing(signal);
     if (!parsed)
       return cached ? new Map(Object.entries(cached.prices)) : undefined;
-    await this.#writeCache(PUBLISHED_PRICING_CACHE_KEY, {
+    await this.#writeCache(this.#pricingKey, {
       prices: Object.fromEntries(parsed.prices),
       fetchedAt: this.#now(),
     });
@@ -550,6 +668,7 @@ export class ZenProvider implements Provider {
   async #readCache<T>(key: string): Promise<T | undefined> {
     if (!this.#db) return undefined;
     try {
+      await this.#discardUnscopedCache();
       const rows = await this.#db.select<{ payload: string }>(
         "SELECT payload FROM model_cache WHERE provider_id = ?",
         [key],
@@ -558,6 +677,31 @@ export class ZenProvider implements Provider {
       return row ? (JSON.parse(row.payload) as T) : undefined;
     } catch {
       return undefined;
+    }
+  }
+
+  /**
+   * Delete the pre-scoping cache rows, once per database.
+   *
+   * They are deleted rather than migrated because the only information they hold
+   * is "some provider listed these models", and which one is not recoverable. A
+   * row written by OpenRouter and read by Gemini is the bug being fixed; moving it
+   * to a scoped key would need a guess, and a wrong guess keeps serving the wrong
+   * list. A refetch costs one request and is the only outcome that cannot be
+   * wrong.
+   */
+  async #discardUnscopedCache(): Promise<void> {
+    if (!this.#db || this.#unscopedCacheDiscarded) return;
+    this.#unscopedCacheDiscarded = true;
+    try {
+      for (const legacy of UNSCOPED_CACHE_KEYS) {
+        await this.#db.execute("DELETE FROM model_cache WHERE provider_id = ?", [
+          legacy,
+        ]);
+      }
+    } catch {
+      // Best-effort. If this fails, the scoped read below still cannot see an
+      // unscoped row, so the wrong list is unreachable either way.
     }
   }
 
@@ -642,6 +786,15 @@ export class ZenProvider implements Provider {
   }
 
   /**
+   * Models currently being re-checked, so a probe cannot probe itself.
+   *
+   * The probe goes through `complete`, which reports its own failures back
+   * through `#learnFrom`. Without this the second refusal would start another
+   * probe, and the two would alternate until the request timed out.
+   */
+  readonly #probing = new Set<string>();
+
+  /**
    * Turn a refusal into something learned about this model, when it is the kind
    * of refusal that will not change by itself.
    *
@@ -662,8 +815,85 @@ export class ZenProvider implements Provider {
     ownKey: string | undefined,
   ): Promise<void> {
     const failure = toProviderError(error);
-    if (isAtomicGated(failure)) {
+    if (!isAtomicGated(failure)) return;
+
+    /*
+     * The refusal only becomes a verdict once something independent agrees with
+     * it. Counting was the first guard against writing a model off on one 403;
+     * counting alone is not enough, because both counts can come from the same
+     * bad minute -- one request that hit a different backend twice still reads
+     * as two refusals.
+     *
+     * So on the refusal that *would* block, the model is asked again before it is
+     * written off. This is the case that matters: `space-bunny-free` was declared
+     * unavailable while it was answering, and a direct re-ask is the only
+     * evidence that separates those two situations.
+     */
+    if (!wouldBlock(this.#availability, modelId)) {
       await this.#record(modelId, { refused: failure.message });
+      return;
+    }
+
+    const verdict = await this.#probeBeforeBlocking(modelId);
+    if (verdict === "reachable") {
+      // The model answered. Everything recorded against it was wrong, including
+      // the refusal that triggered this check, so it goes back to being simply
+      // reachable -- no suspicion, no block, nothing for the UI to explain.
+      await this.#record(modelId, { reachable: true });
+      return;
+    }
+    if (verdict === "inconclusive") {
+      /*
+       * The re-ask failed for a reason that says nothing about the model: a
+       * timeout, a 5xx, a rate limit, an offline machine. The refusal is still
+       * recorded, because it did happen, but the count is held below the
+       * threshold. Blocking here would mean an app that went offline briefly
+       * wrote off every free model it had, and came back unable to use any of
+       * them.
+       */
+      await this.#record(modelId, { refused: failure.message }, { confirm: false });
+      return;
+    }
+    // Refused again, the same way. That is the confirmation, and the model is
+    // now written off.
+    await this.#record(modelId, { refused: failure.message });
+  }
+
+  /**
+   * Ask a model whether it is really there, before writing it off.
+   *
+   * Deliberately the smallest request the wire format allows, and deliberately
+   * inconclusive by default: only a real answer counts as reachable, and only the
+   * free-tier gate counts as a confirmed refusal. Everything else -- a 429, a
+   * 500, a socket that never opened -- leaves the question open, because none of
+   * them is evidence about this model in particular.
+   *
+   * The timeout is short and fixed. This runs on the failure path of a request
+   * the user is already waiting on, so it cannot be allowed to become the reason
+   * that request takes twice as long; running out of time is a valid answer here
+   * and lands in the same `inconclusive` branch as any other network failure.
+   */
+  async #probeBeforeBlocking(
+    modelId: string,
+  ): Promise<"reachable" | "refused" | "inconclusive"> {
+    if (this.#probing.has(modelId)) return "inconclusive";
+    this.#probing.add(modelId);
+    try {
+      const timeout = AbortSignal.timeout(PROBE_TIMEOUT_MS);
+      await this.complete({
+        providerId: this.id,
+        model: modelId,
+        messages: [{ role: "user", content: [{ type: "text", text: "ping" }] }],
+        maxOutputTokens: 1,
+        signal: timeout,
+      });
+      return "reachable";
+    } catch (error) {
+      const failure = toProviderError(error);
+      if (isAtomicGated(failure)) return "refused";
+      return "inconclusive";
+    } finally {
+      this.#probing.delete(modelId);
     }
   }
 
@@ -1065,6 +1295,46 @@ function withSignalFrom(
 interface ModelsDevIndex {
   readonly provider: Record<string, unknown> | undefined;
   readonly models: Record<string, { npm?: string }>;
+}
+
+/** One model as the provider's own listing described it. */
+interface ListedModel {
+  readonly id: string;
+  /**
+   * Present when the provider's listing carries real facts rather than a bare id.
+   *
+   * Its presence changes where the rest of the model's description comes from:
+   * a provider that reports its own limits and modalities is believed about its
+   * own models, and a third-party catalog is only asked about the gaps.
+   */
+  readonly native?: GeminiNativeModel;
+}
+
+/**
+ * Turn a provider's own listing entry into the metadata the catalog builder
+ * wants.
+ *
+ * No `cost` on purpose. This provider publishes no price, and a third-party
+ * price list describing a *different* provider's billing must not be
+ * attributed here -- an invented per-token rate is how a free model ends up
+ * looking paid, and how a paid one ends up looking free.
+ */
+function nativeModelMetadata(native: GeminiNativeModel): ZenModelMetadata {
+  return {
+    name: native.name,
+    ...(native.description ? { description: native.description } : {}),
+    capabilities: {
+      // Google's listing has no tool or vision flags, so the OpenAI-compatible
+      // surface is the evidence: this app reaches Gemini through it.
+      tools: true,
+      vision: true,
+      reasoning: native.reasoning,
+      reasoningEffort: native.reasoning,
+      streaming: true,
+      ...(native.contextWindow ? { contextWindow: native.contextWindow } : {}),
+      ...(native.maxOutput ? { maxOutputTokens: native.maxOutput } : {}),
+    },
+  };
 }
 
 /** A/B for ranking the model picker. */

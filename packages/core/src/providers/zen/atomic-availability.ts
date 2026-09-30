@@ -126,8 +126,22 @@ export function markBlocked(
   };
 }
 
+export interface MarkOptions {
+  /**
+   * Whether this refusal is allowed to complete the confirmation.
+   *
+   * Counting and concluding are separate decisions, and only the caller can tell
+   * them apart. A refusal is only a fact once something independent has agreed
+   * with it; `confirm: false` records the observation and holds the model at
+   * `suspect`, which is what a caller that could not get a second opinion should
+   * do rather than promoting on a single unverified event.
+   */
+  readonly confirm?: boolean;
+}
+
 /**
- * Count one refusal, promoting the model to `blocked` once there are enough.
+ * Count one refusal, promoting the model to `blocked` once there are enough and
+ * the caller allows the conclusion.
  *
  * Returns the updated availability rather than a boolean so the caller has to
  * decide what to persist -- and a caller that persists nothing on the first
@@ -138,7 +152,9 @@ export function markSuspect(
   modelId: string,
   reason: string,
   since = new Date().toISOString(),
+  options: MarkOptions = {},
 ): AtomicAvailability {
+  const confirm = options.confirm ?? true;
   const mark: AtomicAvailabilityMark = { since, reason: trim(reason) };
   // A model already confirmed blocked stays blocked; re-counting it would let a
   // stale entry drift back to "suspect" if two maps were ever merged.
@@ -151,7 +167,7 @@ export function markSuspect(
   }
   const counted = (availability.suspect[modelId]?.count ?? 0) + 1;
   const suspect = omit(availability.suspect, modelId);
-  if (counted >= REFUSALS_TO_CONFIRM) {
+  if (confirm && counted >= REFUSALS_TO_CONFIRM) {
     return {
       blocked: { ...availability.blocked, [modelId]: mark },
       suspect,
@@ -163,6 +179,22 @@ export function markSuspect(
     suspect: { ...suspect, [modelId]: { ...mark, count: counted } },
     reachable: availability.reachable.filter((id) => id !== modelId),
   };
+}
+
+/**
+ * Would recording one more refusal make this model blocked?
+ *
+ * Asked before recording, not after: the caller has to find out whether it is
+ * about to write off a model, so that it can check the model first.
+ */
+export function wouldBlock(
+  availability: AtomicAvailability,
+  modelId: string,
+  options: MarkOptions = {},
+): boolean {
+  if (modelId in availability.blocked) return false;
+  if (options.confirm === false) return false;
+  return (availability.suspect[modelId]?.count ?? 0) + 1 >= REFUSALS_TO_CONFIRM;
 }
 
 /** Record a model that answered a real unauthenticated call. */

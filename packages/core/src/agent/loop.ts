@@ -26,6 +26,7 @@ import {
 } from "../models/types.js";
 import type { ToolRegistry, ToolResult } from "../tools/registry.js";
 import { compactMessages, planCompaction, type CompactionOptions } from "./compaction.js";
+import type { TurnCostReview } from "../models/free-policy.js";
 import type { AgentEventBus, AgentEvent } from "./events.js";
 import type { Mode } from "../settings/schema.js";
 import type { ApprovalBroker } from "./approval.js";
@@ -67,16 +68,22 @@ export interface AgentRunDeps {
    *
    * Called after the usage is known and before any tool runs, because the
    * moment a step turns out to have cost money is the last moment it can be
-   * stopped cheaply. Returning a reason halts the run; the step's text is kept,
-   * since throwing away a real answer because of a pricing surprise would be a
-   * worse lie than showing it with a warning attached.
+   * stopped cheaply.
+   *
+   * Three outcomes, and the middle one is the reason this is a union rather than
+   * a string. `objection` halts the run and the step's text is kept, since
+   * throwing away a real answer because of a pricing surprise would be a worse
+   * lie than showing it with a warning attached. A `note` is not a halt: it is
+   * something the user should know that does not make the answer wrong, like a
+   * free model that publishes no price. Collapsing that into "a string means
+   * stop" is what turned a successful free reply into a red banner.
    */
   readonly reviewUsage?: (input: {
     readonly conversationId: string;
     readonly runId: string;
     readonly model: string;
     readonly usage: Usage;
-  }) => Promise<string | null> | string | null;
+  }) => Promise<TurnCostReview | null> | TurnCostReview | null;
   /**
    * Whether a model is still worth trying, checked as each fallback is reached.
    *
@@ -112,6 +119,8 @@ export interface AgentRunInput {
   readonly system: string | undefined;
   readonly messages: readonly ModelMessage[];
   readonly workspace: string | null;
+  /** Folders the user authorized outside the workspace. See `ToolContext`. */
+  readonly extraRoots?: readonly string[];
   readonly temperature?: number | undefined;
   readonly maxOutputTokens?: number | undefined;
   readonly reasoningEffort?: ReasoningEffort;
@@ -177,6 +186,7 @@ export class AgentLoop {
     let usage: Usage = EMPTY_USAGE;
     let steps = 0;
     let reason: AgentRunResult["reason"] = "stop";
+    let noted = false;
 
     events.emit({
       type: "run-start",
@@ -234,18 +244,18 @@ export class AgentLoop {
         working.push(message.message);
 
         // After the answer is saved, before anything more is spent.
-        const objection = await this.#deps.reviewUsage?.({
+        const review = await this.#deps.reviewUsage?.({
           conversationId: input.conversationId,
           runId: input.runId,
           model: message.modelId,
           usage,
         });
-        if (objection) {
+        if (review && !review.ok) {
           events.emit({
             type: "run-error",
             runId: input.runId,
-            message: objection,
-            userMessage: objection,
+            message: review.reason,
+            userMessage: review.reason,
             kind: "free-policy",
           });
           return {
@@ -255,6 +265,19 @@ export class AgentLoop {
             reason: "error",
             messages: working,
           };
+        }
+
+        // A note, not a halt. The step succeeded, and the thing worth saying is
+        // something the user should know, not something that went wrong. Emitted
+        // once per run because a step-by-step note would repeat the same
+        // sentence on every tool call for the rest of the turn.
+        if (review?.ok && review.note && !noted) {
+          noted = true;
+          events.emit({
+            type: "run-note",
+            runId: input.runId,
+            message: review.note,
+          });
         }
 
         if (message.message.toolCalls?.length) {
@@ -276,6 +299,10 @@ export class AgentLoop {
     } catch (error) {
       if (isAbort(error)) {
         reason = "cancelled";
+      } else if (error instanceof CrossProviderSwitchRequired) {
+        // Already reported as an offer with a button, so it must not also be
+        // rendered as a failure. The run is over either way.
+        reason = "error";
       } else {
         const providerError = toProviderError(error);
         events.emit({
@@ -328,6 +355,7 @@ export class AgentLoop {
     finishReason: FinishReason;
   }> {
     const { input, currentModel } = args;
+    const events = this.#deps.events;
     // `usageRef` is not read by `#streamOnce`; it is threaded for the signature
     // the loop already had. Passed through so the shape stays stable.
     const fallbacks = input.allowModelFallback === false ? [] : (input.fallbackModels ?? []);
@@ -362,11 +390,12 @@ export class AgentLoop {
         // model that just failed. Skipping keeps the counter honest: these are
         // not attempts, and charging them against the cap would silently shorten
         // how far a run can recover.
-        // Prefer a candidate on a *different* provider, but only after checking
-        // that it is usable: a good model on a provider we cannot reach is worse
-        // than a mediocre one we can. So the list is scanned for a usable
-        // cross-provider entry first, and only then for a usable one on this
-        // provider.
+        // Same provider: staying is a fallback, and the user asked for a model
+        // on this provider, so being sent a different one from it needs no
+        // further permission. A *different* provider is a different thing --
+        // a different account, a different key, a different bill, a different
+        // data processor. That is never done behind the user's back, so it is
+        // collected and offered rather than taken.
         //
         // The two passes do not consume the list. A single pass that skipped
         // same-provider entries would have already spent the ones it skipped, so
@@ -391,9 +420,30 @@ export class AgentLoop {
           if ((await this.#deps.isModelUsable?.(candidate)) === false) continue;
           usable.push({ model: candidate, provider: candidateProvider });
         }
+        // Same provider first, and the cross-provider entry is only reached when
+        // the run cannot be finished by this account at all.
         const next =
-          usable.find((entry) => entry.provider !== provider) ?? usable[0];
+          usable.find((entry) => entry.provider === provider) ??
+          usable.find((entry) => entry.provider !== provider);
         if (!next) throw error;
+
+        // The cross-provider case, offered rather than taken.
+        if (next.provider !== provider) {
+          events.emit({
+            type: "provider-switch-required",
+            runId: input.runId,
+            from: model,
+            to: next.model,
+            providerId: next.provider.id,
+            providerLabel: next.provider.name,
+            reason: modelSwitchReason(providerError.kind, providerError.userMessage),
+          });
+          throw new CrossProviderSwitchRequired(
+            next.model,
+            next.provider.id,
+            next.provider.name,
+          );
+        }
         // Every entry up to and including the chosen one is spent; the ones
         // scanned past it are not, so a later failure can still reach them.
         const chosenAt = fallbacks.findIndex(
@@ -545,6 +595,7 @@ export class AgentLoop {
         tool,
         args: call.args,
         workspace: input.workspace,
+        extraRoots: input.extraRoots ?? [],
         conversationId: input.conversationId,
         runId: input.runId,
       });
@@ -639,6 +690,7 @@ export class AgentLoop {
           mode: input.mode,
           signal: input.signal,
           workspace: input.workspace,
+          extraRoots: input.extraRoots ?? [],
           describe: (a) => describeCall({ name: call.name, args: a } as ToolCall),
         });
       } catch (error) {
@@ -723,6 +775,32 @@ function isModelScopedError(kind: string): boolean {
 }
 
 /** One phrase, for the "Switched to X because Y" notice. */
+/**
+ * Thrown when a run cannot be finished by its own account and the only way
+ * forward is a different provider.
+ *
+ * A distinct type because the catch above turns every other error into a
+ * `run-error`, and this one has already been reported as an offer the user can
+ * accept. Reported as a plain failure, the only thing the user could do was
+ * read that it failed -- and the offer to fix it would have scrolled away with
+ * the error banner.
+ */
+export class CrossProviderSwitchRequired extends Error {
+  readonly model: string;
+  readonly providerId: string;
+  readonly providerLabel: string;
+
+  constructor(model: string, providerId: string, providerLabel: string) {
+    super(
+      `${providerLabel} can answer this one. Atomic will not send it there without permission, because that is a different account and a different bill.`,
+    );
+    this.name = "CrossProviderSwitchRequired";
+    this.model = model;
+    this.providerId = providerId;
+    this.providerLabel = providerLabel;
+  }
+}
+
 function modelSwitchReason(kind: string, userMessage: string): string {
   switch (kind) {
     case "rate-limit":

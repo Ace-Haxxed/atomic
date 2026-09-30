@@ -16,6 +16,8 @@ import { describe, expect, it } from "vitest";
 
 import {
   formatBytes,
+  OLLAMA_DEFAULT_ROOT,
+  OllamaUrlError,
   ollamaRootFrom,
   parsePullLine,
   parseShow,
@@ -313,6 +315,49 @@ describe("base URL handling", () => {
 
   it("keeps a custom host and port", () => {
     expect(ollamaRootFrom("http://192.168.1.50:22434/v1")).toBe("http://192.168.1.50:22434");
+  });
+
+  it("accepts https for a proxied Ollama", () => {
+    expect(ollamaRootFrom("https://ollama.internal:443/v1")).toBe("https://ollama.internal:443");
+  });
+
+  /**
+   * These used to fall through to the default, which reported "Ollama isn't
+   * running at localhost:11434" -- a statement about the wrong machine, sent to
+   * someone whose actual mistake was a typo three fields away.
+   */
+  it("refuses a URL with no scheme, and says what one looks like", () => {
+    expect(() => ollamaRootFrom("localhost:11434")).toThrow(OllamaUrlError);
+    expect(() => ollamaRootFrom("localhost:11434")).toThrow(/needs a scheme/);
+    // The message has to show the fix, not just report the problem.
+    expect(() => ollamaRootFrom("localhost:11434")).toThrow(/http:\/\/localhost:11434/);
+  });
+
+  it("refuses a mistyped scheme and names the right one", () => {
+    expect(() => ollamaRootFrom("htp://localhost:11434")).toThrow(/Use http, or https/);
+    expect(() => ollamaRootFrom("ws://localhost:11434")).toThrow(/cannot reach Ollama/);
+  });
+
+  it("refuses a URL with a path, and says where the address should end", () => {
+    expect(() => ollamaRootFrom("http://localhost:11434/api/v1")).toThrow(/no path after the host/);
+    expect(() => ollamaRootFrom("http://localhost:11434/api/v1")).toThrow(/\/api\/v1/);
+  });
+
+  it("keeps the bad URL on the error, for whatever shows it", () => {
+    try {
+      ollamaRootFrom("htp://localhost:11434");
+      expect.unreachable("a bad URL must not be accepted");
+    } catch (error) {
+      expect(error).toBeInstanceOf(OllamaUrlError);
+      expect((error as OllamaUrlError).input).toBe("htp://localhost:11434");
+    }
+  });
+
+  it("still defaults when the address is genuinely unset", () => {
+    // Rejecting a typo must not reject "I never configured one": Ollama runs
+    // with no settings at all, and that is not an error.
+    expect(ollamaRootFrom("")).toBe(OLLAMA_DEFAULT_ROOT);
+    expect(ollamaRootFrom("   ")).toBe(OLLAMA_DEFAULT_ROOT);
   });
 });
 

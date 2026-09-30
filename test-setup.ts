@@ -13,7 +13,29 @@
  * instead of quietly doing it.
  */
 
-import { beforeEach } from "vitest";
+import { afterEach, beforeEach } from "vitest";
+
+/*
+ * DOM test wiring, for the `*.dom.test.tsx` files only.
+ *
+ * Conditional rather than global on purpose: these matchers and this cleanup need
+ * a document, and the server-side render tests run without one. Importing them
+ * unconditionally would fail those files for the sake of tests that never touch a
+ * DOM -- so the node environment keeps exactly the setup it had.
+ */
+if (typeof document !== "undefined") {
+  await import("@testing-library/jest-dom/vitest");
+  const { cleanup } = await import("@testing-library/react");
+  /*
+   * Vitest does not do this automatically unless `globals` is on, and this
+   * config deliberately does not enable globals. Without it every `render` adds
+   * to the same document, and the second test in a file fails on "found multiple
+   * elements" for a reason that has nothing to do with what it asserts.
+   */
+  afterEach(() => {
+    cleanup();
+  });
+}
 
 const realFetch = globalThis.fetch;
 

@@ -86,13 +86,14 @@ function fakeTodos(): TodoStore & { items: TodoItem[] } {
   return store;
 }
 
-const context = (workspace: string | null = "/ws"): ToolContext => ({
+const context = (workspace: string | null = "/ws", extraRoots: readonly string[] = []): ToolContext => ({
   conversationId: "c",
   messageId: "m",
   runId: "r",
   mode: "code",
   signal: new AbortController().signal,
   workspace,
+  extraRoots,
   describe: (args) => JSON.stringify(args),
 });
 
@@ -143,6 +144,204 @@ describe("list_files", () => {
     const { port } = fakeFs({ "a.txt": "x" });
     const result = await run(find(createReadTools(port), "list_files"), {});
     expect(result.content).toContain("a.txt");
+  });
+});
+
+/**
+ * Paths written out in full.
+ *
+ * A model asked to look in a folder the user named by hand will often write the
+ * whole path, because that is what the user said and what it saw in earlier
+ * output. Refusing that on the grounds of its shape is refusing to do the job.
+ *
+ * What this file checks is that the *tool* passes such a path through untouched
+ * and says so in its schema, so a model is not left guessing whether absolute
+ * paths are allowed. Whether the path is actually inside the folder is decided by
+ * the host, which re-checks it on the Rust side against the canonicalized root --
+ * that is covered by `workspace.rs`, and faking it here with a stub port would
+ * only prove the stub agrees with itself.
+ */
+/**
+ * Folders the user added under Settings.
+ *
+ * The contract the tools owe: a folder the user authorized is as usable as the
+ * workspace, and a folder they did not is not. The first half is the feature; the
+ * second is the reason the first is safe. The refusal cases matter just as much
+ * as the working ones, because a tool that quietly passes an unauthorized path
+ * through and lets something downstream decide would be trusting the wrong layer
+ * to be the one that notices.
+ */
+describe("folders added under Settings", () => {
+  const EXTRA = "/home/me/Code";
+
+  it("reaches a file in an added folder when no workspace is open", async () => {
+    // The user authorized a folder and closed the project. Refusing here would
+    // make Settings look broken -- the folder is listed and it is authorized.
+    const { port } = fakeFs({ [`${EXTRA}/src/a.ts`]: "export const a = 1;" });
+    const result = await run(
+      find(createReadTools(port), "read_file"),
+      { path: `${EXTRA}/src/a.ts` },
+      context(null, [EXTRA]),
+    );
+    expect(result.content).toContain("export const a");
+  });
+
+  it("lists an added folder when no workspace is open", async () => {
+    const { port } = fakeFs({ [`${EXTRA}/src/a.ts`]: "x" });
+    const result = await run(
+      find(createReadTools(port), "list_files"),
+      { path: EXTRA },
+      context(null, [EXTRA]),
+    );
+    expect(result.content).toContain("src");
+  });
+
+  it("creates a file in an added folder", async () => {
+    const { port, files } = fakeFs();
+    await run(
+      find(createWriteTools(port), "write_file"),
+      { path: `${EXTRA}/new.ts`, content: "made" },
+      context(null, [EXTRA]),
+    );
+    expect(files.get(`${EXTRA}/new.ts`)).toBe("made");
+  });
+
+  it("hands the host every root, workspace first", async () => {
+    // The list is the authorization. A tool that sent only the workspace would
+    // leave an added folder looking absent, and the model would conclude the
+    // user's own folder does not exist.
+    const seen: string[][] = [];
+    const port: FileSystemPort = {
+      ...fakeFs().port,
+      async listDirectory(roots, path) {
+        seen.push([...roots]);
+        return { entries: [], truncated: false };
+      },
+    };
+    await run(
+      find(createReadTools(port), "list_files"),
+      { path: "." },
+      context("/ws", [EXTRA, "/home/me/Docs"]),
+    );
+    expect(seen).toEqual([["/ws", EXTRA, "/home/me/Docs"]]);
+  });
+
+  it("does not repeat a folder that is also the workspace", async () => {
+    const seen: string[][] = [];
+    const port: FileSystemPort = {
+      ...fakeFs().port,
+      async listDirectory(roots) {
+        seen.push([...roots]);
+        return { entries: [], truncated: false };
+      },
+    };
+    await run(find(createReadTools(port), "list_files"), { path: "." }, context("/ws", ["/ws"]));
+    expect(seen).toEqual([["/ws"]]);
+  });
+
+  it("still refuses when nothing is open and nothing has been added", async () => {
+    const { port } = fakeFs({ "a.ts": "x" });
+    await expect(
+      run(find(createReadTools(port), "read_file"), { path: "a.ts" }, context(null, [])),
+    ).rejects.toThrow(/no folder open/i);
+  });
+
+  it("says where to add a folder when nothing is open", async () => {
+    // "No folder open" alone is a dead end for a model that cannot open one.
+    // Naming the setting turns a dead end into a request the user can answer.
+    const { port } = fakeFs({ "a.ts": "x" });
+    await expect(
+      run(find(createReadTools(port), "list_files"), {}, context(null, [])),
+    ).rejects.toThrow(/settings/i);
+  });
+
+  it("passes an unauthorized path to the host rather than deciding here", async () => {
+    // The tool is not the enforcement point and must not pretend to be. A path
+    // outside every root still reaches the port, which re-checks it against the
+    // real filesystem -- a textual check in TypeScript would be bypassable by
+    // anything the resolver canonicalizes differently.
+    const seen: string[] = [];
+    const port: FileSystemPort = {
+      ...fakeFs().port,
+      async listDirectory(_roots, path) {
+        seen.push(path);
+        return { entries: [], truncated: false };
+      },
+    };
+    await run(
+      find(createReadTools(port), "list_files"),
+      { path: "/etc" },
+      context("/ws", [EXTRA]),
+    );
+    expect(seen).toEqual(["/etc"]);
+  });
+});
+
+describe("absolute paths", () => {
+  const absolute = "/home/me/project/src";
+
+  it("passes an absolute directory through to the host when listing", async () => {
+    const seen: string[] = [];
+    const port: FileSystemPort = {
+      ...fakeFs({ "src/a.txt": "x" }).port,
+      async listDirectory(_root, path) {
+        seen.push(path);
+        return { entries: [], truncated: false };
+      },
+    };
+    await run(find(createReadTools(port), "list_files"), { path: absolute });
+    expect(seen).toEqual([absolute]);
+  });
+
+  it("passes an absolute file path through when reading", async () => {
+    const seen: string[] = [];
+    const port: FileSystemPort = {
+      ...fakeFs().port,
+      async readFile(_root, path) {
+        seen.push(path);
+        throw new Error("no such file in the workspace");
+      },
+    };
+    await expect(
+      run(find(createReadTools(port), "read_file"), { path: `${absolute}/a.ts` }),
+    ).rejects.toThrow();
+    expect(seen).toEqual([`${absolute}/a.ts`]);
+  });
+
+  it("passes an absolute file path through when writing, so a new file can be made there", async () => {
+    const seen: string[] = [];
+    const port: FileSystemPort = {
+      ...fakeFs().port,
+      async writeFile(_root, path, content) {
+        seen.push(path);
+        return { path, name: "new.ts", isDir: false, size: content.length };
+      },
+    };
+    const result = await run(find(createWriteTools(port), "write_file"), {
+      path: `${absolute}/new.ts`,
+      content: "x",
+    });
+    expect(seen).toEqual([`${absolute}/new.ts`]);
+    expect(result.content).toContain("new.ts");
+  });
+
+  it("still refuses a `..` escape, which is not the same thing as an absolute path", async () => {
+    // The two look similar to a regex and mean opposite things: a full path is
+    // naming a location the host can check, `..` is climbing out of one.
+    const { port } = fakeFs({ "a.txt": "x" });
+    await expect(
+      run(find(createReadTools(port), "read_file"), { path: "../outside.txt" }),
+    ).rejects.toThrow();
+  });
+
+  it("tells the model in its schema that an absolute path is acceptable", () => {
+    // Silence here is what produces the retries: a model that guessed wrong once
+    // will try relative paths forever rather than conclude the folder is closed.
+    for (const tool of [...createReadTools(fakeFs().port), ...createWriteTools(fakeFs().port)]) {
+      const described = JSON.stringify(tool.parameters);
+      if (!described.includes("path")) continue;
+      expect(described).toMatch(/absolute/i);
+    }
   });
 });
 

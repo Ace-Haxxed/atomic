@@ -104,7 +104,11 @@ export {
 export {
   MemorySecretStore,
   SecretKeys,
+  LEGACY_PROVIDER_IDS,
   maskSecret,
+  secretSlotsFor,
+  withProvider,
+  type ApiKeySource,
   type SecretStore,
 } from "./secrets/secret-store.js";
 
@@ -142,6 +146,7 @@ export {
 export {
   OLLAMA_DEFAULT_ROOT,
   formatBytes,
+  OllamaUrlError,
   ollamaRootFrom,
   OLLAMA_PROVIDER_ID,
   parsePullLine,
@@ -255,6 +260,7 @@ export {
   MODELS_DEV_URL,
   readModelMetadata,
 } from "./providers/zen/models-dev.js";
+export { providerCacheKey } from "./providers/zen/provider.js";
 
 // ---- tools & permissions -------------------------------------------------
 export {
@@ -381,8 +387,10 @@ export {
   isAtomicGated,
   isSuspectedInAtomic,
   normalizeAvailability,
+  wouldBlock,
   type AtomicAvailability,
   type AtomicAvailabilityMark,
+  type MarkOptions,
 } from "./providers/zen/atomic-availability.js";
 export {
   AUTO_MODEL,

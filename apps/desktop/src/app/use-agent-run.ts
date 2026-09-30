@@ -32,6 +32,20 @@ export interface ToolActivity {
   readonly detail?: string;
 }
 
+/**
+ * Another provider could answer this one, if the user says so.
+ *
+ * Everything the retry needs is in here, so accepting the offer cannot depend
+ * on state that has since been cleared -- the run is over by the time the
+ * button is pressed.
+ */
+export interface ProviderOffer {
+  readonly model: string;
+  readonly providerId: string;
+  readonly providerLabel: string;
+  readonly reason: string;
+}
+
 export interface RunState {
   readonly runId: string | null;
   readonly conversationId: string | null;
@@ -59,6 +73,23 @@ export interface RunState {
    * answer. Shown above the reply rather than in a log nobody opens.
    */
   readonly modelSwitched: string | null;
+  /**
+   * Something worth saying about a run that otherwise succeeded.
+   *
+   * Held apart from `error` on purpose. A free model that publishes no price is
+   * a fact about the model, not a failure, and putting it in `error` painted a
+   * successful answer red and made the reply look lost.
+   */
+  readonly note: string | null;
+  /**
+   * A provider the run needs but will not use without permission.
+   *
+   * A question, not a notice and not an error: the run is over, nothing failed
+   * for a reason the user can act on, and the only way forward is a button that
+   * re-sends their own message to the provider they approve. Kept out of
+   * `error` so it does not read as a crash.
+   */
+  readonly providerOffer: ProviderOffer | null;
   /**
    * True when the last run was cut off at the provider's output-token limit.
    *
@@ -89,6 +120,8 @@ export const IDLE: RunState = {
   error: null,
   errorKind: null,
   modelSwitched: null,
+  note: null,
+  providerOffer: null,
   truncated: false,
   settled: false,
   settledAt: 0,
@@ -206,6 +239,24 @@ export function reduce(state: RunState, event: AgentEvent): RunState {
     case "usage":
       return state.runId === event.runId
         ? { ...state, usage: addUsage(state.usage, event.usage) }
+        : state;
+    case "provider-switch-required":
+      return state.runId === event.runId
+        ? {
+            ...state,
+            providerOffer: {
+              model: event.to,
+              providerId: event.providerId,
+              providerLabel: event.providerLabel,
+              reason: event.reason,
+            },
+          }
+        : state;
+    case "run-note":
+      // Only the first note of a run: the loop may review every step, and the
+      // sentence would otherwise repeat on every tool call.
+      return state.runId === event.runId && state.note === null
+        ? { ...state, note: event.message }
         : state;
     case "compacted":
     case "run-error":

@@ -8,11 +8,13 @@
  */
 
 import { AgentLoop } from "../agent/loop.js";
+import { freenessFor } from "../models/freeness.js";
 import {
   FreePolicyError,
   checkModelPolicy,
   reviewTurnCost,
   type ObservedCost,
+  type TurnCostReview,
 } from "../models/free-policy.js";
 import {
   ApprovalBroker,
@@ -72,7 +74,9 @@ import {
 } from "../settings/schema.js";
 import {
   SecretKeys,
+  secretSlotsFor,
   withProvider,
+  type ApiKeySource,
   type SecretStore,
 } from "../secrets/secret-store.js";
 import { ToolRegistry } from "../tools/registry.js";
@@ -451,7 +455,53 @@ export class LocalHost implements HostApi {
 
   /** Writes to the OS keychain. Never touches SQLite, never logged. */
   /**
-   * Save an API key.
+   * Read a provider's key, adopting a legacy slot if that is where it is.
+   *
+   * Adoption is one-way and happens once: the value is written to the canonical
+   * slot and the old one is deleted, so the key is never left in two places and a
+   * second read does not depend on the migration having run.
+   */
+  async #readKey(providerId: string): Promise<string | null> {
+    const slots = secretSlotsFor(providerId);
+    const [canonical, ...legacy] = slots;
+    const current = await this.#secrets.get(canonical);
+    if (current) return current;
+    for (const slot of legacy) {
+      const stranded = await this.#secrets.get(slot);
+      if (!stranded) continue;
+      await this.#secrets.set(canonical, stranded);
+      await this.#secrets.delete(slot);
+      return stranded;
+    }
+    return null;
+  }
+
+  /**
+   * Whether an environment variable holds a credential.
+   *
+   * The host's own `env` is consulted only when the store cannot answer, which
+   * is the shape of every test and of the node/web hosts.
+   */
+  async #envPresent(name: string): Promise<boolean> {
+    if (this.#secrets.hasEnv) return this.#secrets.hasEnv(name);
+    return Boolean(this.#services.env[name]);
+  }
+
+  /** One environment variable's value, fetched at the moment it is needed. */
+  async #envRead(name: string): Promise<string | null> {
+    if (this.#secrets.readEnv) return this.#secrets.readEnv(name);
+    return this.#services.env[name] ?? null;
+  }
+
+  /**
+   * Save an API key for one provider.
+   *
+   * Scoped to `providerId` on purpose. This used to be reachable from a form
+   * bound to the app's *current* provider, so storing a second key meant
+   * re-pointing the whole app at that provider first -- which is why the app
+   * looked like it could only ever hold one or two keys. Nothing here reads or
+   * writes `settings.providerId`; a key is a property of a provider, not of the
+   * currently selected one.
    *
    * The value is normalised before it is stored, not when it is read, so a key
    * that is wrong here is wrong in the keychain rather than only on one request
@@ -460,15 +510,53 @@ export class LocalHost implements HostApi {
    * Both are invisible on screen, both produce an opaque 401, and neither is
    * something the user can see to fix -- so they are rejected here, where the
    * message can say what actually happened.
+   *
+   * The write is then read back, presence only. A credential store that accepts
+   * a write and cannot return it is a real state on Linux without a Secret
+   * Service, and reporting "saved" there is worse than reporting the failure.
    */
   async setApiKey(
     providerId: string,
     apiKey: string | null,
   ): Promise<Settings> {
+    // A key written for a provider this build does not have is a credential
+    // parked in a slot nothing will ever read, and the field that could have
+    // written it is gone by the time anyone notices. Refuse it here.
+    if (providerById(providerId) === null) {
+      throw new ProviderError(
+        ProviderErrorKind.config,
+        "unknown_provider",
+        `Atomic has no provider called "${providerId}", so the key was not saved.`,
+      );
+    }
     const key = secretKeyFor(providerId);
     const normalized = normalizeApiKey(apiKey);
-    if (normalized === null) await this.#secrets.delete(key);
-    else await this.#secrets.set(key, normalized);
+    if (normalized === null) {
+      await this.#secrets.delete(key);
+      if (await this.#secrets.get(key)) {
+        throw new ProviderError(
+          ProviderErrorKind.config,
+          "api_key_delete_failed",
+          `The saved ${providerLabel(providerId)} key did not clear. Remove it from your OS credential store and try again.`,
+        );
+      }
+    } else {
+      if (!(await this.#secrets.isAvailable())) {
+        throw new ProviderError(
+          ProviderErrorKind.config,
+          "secret_store_unavailable",
+          `Your system credential store is not available, so the ${providerLabel(providerId)} key was not saved. Check that your keychain or credential manager is unlocked, then try again.`,
+        );
+      }
+      await this.#secrets.set(key, normalized);
+      if (!(await this.#secrets.get(key))) {
+        throw new ProviderError(
+          ProviderErrorKind.config,
+          "api_key_write_unverified",
+          `The ${providerLabel(providerId)} key was not saved. Your system credential store accepted the write but did not return it, so Atomic cannot confirm it is usable. Nothing was changed.`,
+        );
+      }
+    }
 
     const settings = this.#settings.get();
     const current = settings.providers[providerId];
@@ -479,8 +567,31 @@ export class LocalHost implements HostApi {
   }
 
   async hasApiKey(providerId: string): Promise<boolean> {
-    const value = await this.#secrets.get(secretKeyFor(providerId));
-    return Boolean(value);
+    return Boolean(await this.#readKey(providerId));
+  }
+
+  /**
+   * Where each provider's credential comes from, for the keys list.
+   *
+   * Presence only. The UI needs "saved in your keychain" versus "reached by
+   * GEMINI_API_KEY" versus "no key", and none of those distinctions require a
+   * value to cross into the webview.
+   */
+  async apiKeySources(): Promise<Readonly<Record<string, ApiKeySource>>> {
+    const out: Record<string, ApiKeySource> = {};
+    for (const definition of PROVIDERS) {
+      if (isKeylessProvider(definition.id)) {
+        out[definition.id] = "none";
+        continue;
+      }
+      if (await this.#readKey(definition.id)) {
+        out[definition.id] = "keychain";
+        continue;
+      }
+      const envVar = this.#envVarFor(definition.id);
+      out[definition.id] = (envVar && (await this.#envPresent(envVar))) ? "env" : "none";
+    }
+    return out;
   }
 
   /**
@@ -634,7 +745,7 @@ export class LocalHost implements HostApi {
   async #configuredProviderObjects(): Promise<readonly Provider[]> {
     const out: Provider[] = [];
     const settings = this.#settings.get();
-    const keys = await this.#providerKeyStatus();
+    const keys = await this.providerKeyStatus();
     for (const definition of configuredProviders(settings, keys)) {
       const provider = await this.#provider(definition.id).catch(() => undefined);
       if (provider) out.push(provider);
@@ -836,7 +947,7 @@ export class LocalHost implements HostApi {
     onSection?: (section: ProviderModels) => void,
   ): Promise<readonly ProviderModels[]> {
     const settings = this.#settings.get();
-    const keys = await this.#providerKeyStatus();
+    const keys = await this.providerKeyStatus();
     const providers = configuredProviders(settings, keys);
 
     // Still `Promise.all`, because the returned array has to be complete for
@@ -964,27 +1075,13 @@ export class LocalHost implements HostApi {
   }
 
   async providerKeyStatus(): Promise<Readonly<Record<string, boolean>>> {
-    return this.#providerKeyStatus();
-  }
-
-  async #providerKeyStatus(): Promise<Record<string, boolean>> {
-    const settings = this.#settings.get();
+    const sources = await this.apiKeySources();
     const out: Record<string, boolean> = {};
-    for (const definition of PROVIDERS) {
-      if (isKeylessProvider(definition.id)) {
-        out[definition.id] = true;
-        continue;
-      }
-      const stored = await this.#secrets.get(secretKeyFor(definition.id));
-      if (stored) {
-        out[definition.id] = true;
-        continue;
-      }
-      // An env var counts as configured: the key never enters the keychain, but
-      // the provider can still be reached with it.
-      const envVar =
-        settings.providers[definition.id]?.apiKeyEnvVar || definition.envVar;
-      out[definition.id] = Boolean(envVar && this.#services.env[envVar]);
+    for (const [providerId, source] of Object.entries(sources)) {
+      // Keyless providers count as reachable with nothing saved, which is what
+      // the "Add key" prompts and the provider sections are asking.
+      out[providerId] =
+        source === "keychain" || source === "env" || isKeylessProvider(providerId);
     }
     return out;
   }
@@ -1156,9 +1253,9 @@ export class LocalHost implements HostApi {
   async #reviewTurnCost(input: {
     model: string;
     providerId: string;
-    usage: Pick<Usage, "inputTokens" | "outputTokens">;
+    usage: Pick<Usage, "inputTokens" | "outputTokens" | "reportedCost">;
     settings: Settings;
-  }): Promise<string | null> {
+  }): Promise<TurnCostReview | null> {
     const provider = await this.#provider(input.providerId);
     if (!provider) return null;
 
@@ -1172,12 +1269,36 @@ export class LocalHost implements HostApi {
     }
     if (!entry) return null;
 
+    // How the catalog and this provider's own pricing classify the model, so the
+    // post-turn guard can tell "unpriced" from "unpriced and known free". Those
+    // are different facts and the old guard could not see the difference.
+    const definition = providerById(input.providerId);
     const verdict = reviewTurnCost({
       model: entry,
       usage: input.usage,
       policy: { onlyFree: input.settings.autoSelectFreeModelsOnly },
+      // Carried through only when the provider actually sent one. Passing the
+      // field unconditionally would turn "did not report" into a reported zero,
+      // which is the one value the guard cannot distinguish from a real free
+      // turn -- so the absence has to stay an absence.
+      ...(input.usage.reportedCost !== undefined
+        ? { providerReportedCost: input.usage.reportedCost }
+        : {}),
+      ...(definition
+        ? { freeness: freenessFor(definition, entry).freeness }
+        : {}),
     });
-    if (verdict.ok) return null;
+    if (verdict.ok) {
+      /*
+       * Only a price that came out as zero counts as evidence. Recording every
+       * allowed turn as free meant the common unpriced case -- a model nobody
+       * publishes a rate for -- was treated as known free from its first reply,
+       * and the pre-send gate stopped asking about it. So Atomic stopped
+       * checking, on the strength of having not learned anything.
+       */
+      if (verdict.observed !== undefined) this.#observedCost.set(input.model, verdict.observed);
+      return verdict;
+    }
 
     // Worth remembering: the model that produced it is no longer free, so the
     // next turn gets asked about it instead of discovering it again.
@@ -1185,7 +1306,7 @@ export class LocalHost implements HostApi {
       input.model,
       verdict.cost === null ? "unknown" : verdict.cost > 0 ? "paid" : "free",
     );
-    return verdict.reason;
+    return verdict;
   }
 
   /**
@@ -1261,6 +1382,64 @@ export class LocalHost implements HostApi {
     return { runId };
   }
 
+  /**
+   * Answer the pending question on a provider the user explicitly chose.
+   *
+   * The failing turn's user message is already in the transcript, so this
+   * re-runs the loop on the existing conversation and adds nothing to it. It
+   * used to go back through `sendMessage` with the same text, which appended a
+   * second copy of the user's message: the same question twice, one answer, and
+   * a transcript that no longer matched what the user typed.
+   *
+   * Pinned, with no fallbacks. The user named this provider, so a second silent
+   * switch would be the thing they just declined -- if this one fails too, the
+   * run ends and offers again rather than deciding for them.
+   */
+  async retryOnProvider(input: {
+    readonly conversationId: string;
+    readonly model: string;
+    readonly providerId: string;
+  }): Promise<{ readonly runId: string }> {
+    const conversation = await this.#conversations.get(input.conversationId);
+    if (!conversation)
+      throw new Error(`Conversation ${input.conversationId} not found`);
+
+    const mode = conversation.mode;
+    const runId = this.#newId();
+    const controller = new AbortController();
+    this.#active.set(runId, {
+      runId,
+      conversationId: conversation.id,
+      controller,
+    });
+    await this.#runs.start({
+      id: runId,
+      conversationId: conversation.id,
+      mode,
+      task: "retry on another provider",
+      workspace: conversation.workspace,
+    });
+    this.#audit.write({
+      kind: "run-start",
+      conversationId: conversation.id,
+      runId,
+      mode,
+      summary: `Retry on ${input.providerId}`,
+    });
+    void this.#runLoop({
+      providerId: input.providerId,
+      conversation,
+      runId,
+      controller,
+      model: input.model,
+      pinned: true,
+      fallbacks: [],
+      mode,
+      systemOverride: null,
+    });
+    return { runId };
+  }
+
   async sendMessage(input: SendMessageInput): Promise<SendMessageResult> {
     const conversation = await this.#conversations.get(input.conversationId);
     if (!conversation)
@@ -1276,7 +1455,11 @@ export class LocalHost implements HostApi {
     let fallbacks: readonly { readonly model: string; readonly providerId: string }[] = [];
     if (input.model) {
       model = input.model;
-      providerId = await this.providerForModel(input.model);
+      // An explicit provider is a user decision and is used as given. Without
+      // it the catalog is consulted, which is a guess -- and a wrong guess
+      // sends the conversation to an account the user never chose.
+      providerId =
+        input.providerId ?? (await this.providerForModel(input.model));
       pinned = true;
     } else if (conversation.model) {
       model = conversation.model;
@@ -1521,6 +1704,11 @@ export class LocalHost implements HostApi {
         system,
         messages: modelMessages,
         workspace: conversation.workspace,
+        // Passed through as the user stored them. Both consumers of this list --
+        // the permission gate and the file tools -- only ever widen containment,
+        // so a folder that also happens to be the workspace is harmless here and
+        // is normalized once, where the roots are actually combined.
+        extraRoots: settings.files?.allowedFolders ?? [],
         signal: controller.signal,
         // Only an auto-selected model may be substituted. A model the user picked
         // answers with itself or not at all.
@@ -1697,11 +1885,14 @@ export class LocalHost implements HostApi {
       apiKeySource: "unset" as const,
       apiKeyEnvVar: "",
     };
-    // Keychain first, then the environment variable the provider documents.
-    const envVar = providerSettings.apiKeyEnvVar || known.envVar;
+    // Keychain first, then the environment variable the provider documents. The
+    // variable's value is read now, for this provider, rather than from a map of
+    // every key in the environment that was fetched at startup and held for the
+    // life of the process.
+    const envVar = this.#envVarFor(providerId);
     const apiKey =
-      (await this.#secrets.get(secretKeyFor(providerId))) ??
-      (envVar ? this.#services.env[envVar] : undefined) ??
+      (await this.#readKey(providerId)) ??
+      (envVar ? await this.#envRead(envVar) : null) ??
       null;
     return new ZenProvider(
       {
@@ -1711,14 +1902,36 @@ export class LocalHost implements HostApi {
       },
       {
         db: this.#db,
-        env: this.#services.env,
+        // `apiKey` above already resolved keychain-then-environment, so handing
+        // the whole environment over as a fallback would only re-introduce the
+        // standing map this method used to pass.
+        env: {},
         now: this.#now,
+        // The identity and the label of the provider this instance answers for.
+        // Without these it claimed to be Zen, so a Gemini run was recorded,
+        // priced and offered as a fallback as OpenCode Zen.
+        providerId: known.id,
+        label: known.label,
+        ...(known.catalogSource
+          ? { catalogSource: known.catalogSource }
+          : {}),
         // Only Zen publishes the routing table the id heuristics are built on.
         hasRoutingTable: known.id === ZEN_PROVIDER_ID,
         defaultWireFormat: known.defaultWireFormat,
         ...(this.#services.fetch ? { fetch: this.#services.fetch } : {}),
       },
     );
+  }
+
+  /**
+   * The environment variable a provider's key is read from.
+   *
+   * The per-provider setting wins over the registry default, so a provider whose
+   * key is not in the conventional variable can still be reached.
+   */
+  #envVarFor(providerId: string): string {
+    const known = providerById(providerId);
+    return this.#settings.get().providers[providerId]?.apiKeyEnvVar || known?.envVar || "";
   }
 }
 
@@ -1790,13 +2003,15 @@ function normalizeApiKey(value: string | null): string | null {
 }
 
 /**
- * The keychain slot for a provider's key.
+ * The canonical keychain slot for a provider's key.
  *
- * `SecretKeys` is the only place these strings are written down. The previous
- * version carried its own copy of the mapping *and* an independent template, so
- * a provider added to one list and not the other would read from a different
- * slot than it wrote to -- a key that saves fine and then reads as absent. Both
- * the mapping and the derived form now come from the secrets module.
+ * `SecretKeys` is the only place these strings are written down, and the previous
+ * version carried its own copy of the mapping *and* an independent template, so a
+ * provider added to one list and not the other read from a different slot than it
+ * wrote to -- a key that saved fine and then read as absent. The mapping and the
+ * derived form now come from the same place, and the check below fails loudly if
+ * the documented constant ever drifts from the derived name, which is the only way
+ * this bug can come back.
  */
 function secretKeyFor(providerId: string): string {
   const known: Record<string, string> = {
@@ -1805,7 +2020,18 @@ function secretKeyFor(providerId: string): string {
     openrouter: SecretKeys.openrouter,
     ollama: SecretKeys.ollama,
   };
-  return known[providerId] ?? withProvider(providerId);
+  const documented = known[providerId];
+  if (documented !== undefined && documented !== withProvider(providerId)) {
+    throw new Error(
+      `SecretKeys.${providerId} ("${documented}") does not match withProvider("${providerId}") ("${withProvider(providerId)}"). A key written to one slot would be read from the other.`,
+    );
+  }
+  return secretSlotsFor(providerId)[0];
+}
+
+/** The registry's label for a provider, or its id when this build has no entry. */
+function providerLabel(providerId: string): string {
+  return providerById(providerId)?.label ?? providerId;
 }
 
 export function defaultId(): string {

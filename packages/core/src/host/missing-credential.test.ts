@@ -342,7 +342,7 @@ describe("a key is read from the slot it was written to", () => {
     expect(withProvider("ollama")).toBe(SecretKeys.ollama);
   });
 
-  it("gives an unrecognised provider its own slot rather than a shared one", async () => {
+  it("gives each provider its own slot rather than a shared one", async () => {
     const db = await migratedTestDatabase();
     const secrets = new MemorySecretStore();
     const settings = new SettingsStore(db, { providerId: "opencode-zen" });
@@ -353,11 +353,33 @@ describe("a key is read from the slot it was written to", () => {
     } as unknown as HostServices;
     const instance = new LocalHost({ db, secrets, settings, services });
     try {
-      await instance.setApiKey("some-new-provider", "sk-x");
+      await instance.setApiKey("google", "AIza-example");
       await instance.setApiKey("opencode-zen", "sk-y");
       // Two providers must not collide on one slot.
-      expect(await secrets.get(withProvider("some-new-provider"))).toBe("sk-x");
+      expect(await secrets.get(withProvider("google"))).toBe("AIza-example");
       expect(await secrets.get(SecretKeys.zen)).toBe("sk-y");
+    } finally {
+      await db.close();
+    }
+  });
+
+  it("refuses to store a key for a provider this build does not have", async () => {
+    // Writing one used to succeed, which parked a credential in a slot nothing
+    // would ever read and left the user believing they had saved it.
+    const db = await migratedTestDatabase();
+    const secrets = new MemorySecretStore();
+    const settings = new SettingsStore(db, { providerId: "opencode-zen" });
+    const services = {
+      env: {},
+      ownKeys: {},
+      fetch: vi.fn(),
+    } as unknown as HostServices;
+    const instance = new LocalHost({ db, secrets, settings, services });
+    try {
+      await expect(
+        instance.setApiKey("some-new-provider", "sk-x"),
+      ).rejects.toThrow();
+      expect(await secrets.get(withProvider("some-new-provider"))).toBeNull();
     } finally {
       await db.close();
     }
