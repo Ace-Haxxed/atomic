@@ -164,6 +164,4 @@ artifacts on a tag.
 pnpm tauri signer generate -w ~/.tauri/atomic.key   # once
 ```
 
-## Licence
 
-MIT.
