@@ -27,7 +27,7 @@ import {
 import type { ToolRegistry, ToolResult } from "../tools/registry.js";
 import { compactMessages, planCompaction, type CompactionOptions } from "./compaction.js";
 import type { TurnCostReview } from "../models/free-policy.js";
-import type { AgentEventBus, AgentEvent } from "./events.js";
+import type { AgentEventBus, AgentEvent, RunFinishReason } from "./events.js";
 import type { Mode, Settings } from "../settings/schema.js";
 import type { ApprovalBroker, ApprovalDecision } from "./approval.js";
 
@@ -138,12 +138,15 @@ export interface AgentRunInput {
   readonly reasoningEffort?: ReasoningEffort;
   readonly maxSteps?: number;
   /**
-   * The mode's permission settings, passed through so run limits declared
-   * alongside a mode (e.g. `maxSteps`/`maxRuntimeSeconds`) are enforced in the
-   * loop rather than only exposed in the UI. Spend caps are intentionally not
-   * enforced by a naive "billed > limit" comparison because reported cost is not
-   * always present and cannot be safely accumulated from partial turn reports
-   * without conflating estimates with billed amounts.
+   * The mode's permission settings, passed through so the run limits declared
+   * alongside a mode are enforced here rather than only displayed in the UI:
+   * `maxSteps`, `maxRuntimeSeconds`, and `maxSpendUsd`.
+   *
+   * The spend cap accumulates the per-turn classification from
+   * `free-policy.ts` -- billed, estimated, free, unknown -- rather than reading
+   * `usage.reportedCost`, which is absent on most providers and would make the
+   * cap incapable of firing on exactly the runs it exists for. See the
+   * accumulator below for how an unknown turn is handled.
    */
   readonly settings?: Pick<Settings, "permissions">;
   readonly signal: AbortSignal;
@@ -185,7 +188,7 @@ export interface AgentRunResult {
    * unless they are kept apart, and the difference is the whole point of the
    * Continue action.
    */
-  readonly reason: "stop" | "tool-calls" | "cancelled" | "limit" | "length" | "error";
+  readonly reason: RunFinishReason;
   readonly messages: ModelMessage[];
 }
 
@@ -205,6 +208,7 @@ export class AgentLoop {
     const maxRuntimeMs = modeSettings?.maxRuntimeSeconds
       ? modeSettings.maxRuntimeSeconds * 1000
       : 0;
+    const maxSpendUsd = modeSettings?.maxSpendUsd ?? 0;
     const tools = registry.specs(input.mode);
     // The repo's own clock, so the limit below is observable rather than only
     // reachable by waiting. `Date.now` would make this untestable without a
@@ -216,6 +220,11 @@ export class AgentLoop {
     let steps = 0;
     let reason: AgentRunResult["reason"] = "stop";
     let noted = false;
+    // The run's running total, and the turns it could not be established for.
+    // Kept apart because a total that quietly included guesses is the failure
+    // this replaces; so is a total that silently omits them.
+    let spentUsd = 0;
+    let unpricedTurns = 0;
     const startedAt = now();
 
     events.emit({
@@ -234,18 +243,31 @@ export class AgentLoop {
           break;
         }
         if (steps >= maxSteps) {
+          // Said out loud, because this break is otherwise invisible: the run
+          // simply stops, mid-task, with the last tool result on screen and
+          // nothing to say the agent ran out of budget rather than finishing.
+          // Someone watching a 200-step Cowork run has no way to tell those.
+          events.emit({
+            type: "run-note",
+            runId: input.runId,
+            message: `The run stopped after ${steps} steps, the step limit set in settings. Raise it or turn it off if you want the agent to keep going.`,
+          });
           reason = "limit";
           break;
         }
         if (maxRuntimeMs > 0 && now() - startedAt >= maxRuntimeMs) {
+          const reached = `The run reached the time limit of ${Math.round(maxRuntimeMs / 1000)}s set in settings, so it was stopped.`;
           events.emit({
             type: "run-error",
             runId: input.runId,
-            message: "The run reached the time limit set in settings.",
-            userMessage: "The run reached the time limit set in settings.",
+            message: reached,
+            userMessage: reached,
             kind: "provider",
           });
-          reason = "error";
+          // A limit, not a failure. The vocabulary now has a word for it, and
+          // using "error" here is what made a timeout indistinguishable from a
+          // broken provider.
+          reason = "limit";
           break;
         }
         steps++;
@@ -321,6 +343,46 @@ export class AgentLoop {
           });
         }
 
+        /*
+         * The run-level spend budget.
+         *
+         * Accumulated from `review.spend` rather than from `usage.reportedCost`,
+         * which is the difference between a cap that works and one that cannot
+         * fire on the runs it exists for. Reported cost is absent on most
+         * providers, so a `reportedCost ?? 0` check reads a paid turn as free and
+         * never trips -- exactly on a long Cowork run against OpenRouter, where
+         * it is reported, and against anything else, where it is not, so the cap
+         * silently protects only some runs.
+         *
+         * `free` adds a real zero. `unknown` adds nothing *and* is counted, so
+         * the run can end by admitting the cap did not cover it rather than
+         * reporting a total that looks like it did.
+         */
+        if (review) {
+          if (review.spend.kind !== "unknown" && review.spend.kind !== "free") {
+            spentUsd += review.spend.usd;
+          }
+          if (review.spend.kind === "unknown") unpricedTurns += 1;
+
+          if (maxSpendUsd > 0 && spentUsd >= maxSpendUsd) {
+            const reached = `This run spent $${spentUsd.toFixed(4)}, reaching the $${maxSpendUsd.toFixed(2)} spend limit set in settings, so it was stopped.`;
+            events.emit({
+              type: "run-error",
+              runId: input.runId,
+              message: reached,
+              userMessage: reached,
+              kind: "free-policy",
+            });
+            return {
+              runId: input.runId,
+              steps,
+              usage,
+              reason: "limit",
+              messages: working,
+            };
+          }
+        }
+
         if (message.message.toolCalls?.length) {
           await this.#runTools({
             input,
@@ -364,10 +426,35 @@ export class AgentLoop {
       }
     }
 
+    /*
+     * The admission that goes with the cap.
+     *
+     * Only fires when a limit was set *and* at least one turn could not be
+     * priced, because that is the only situation where "the run stopped within
+     * its budget" is not something Atomic actually knows. Emitted before
+     * `run-finish` so it is on screen with the answer rather than after, and
+     * once because a per-turn reminder would be noise on a multi-tool run.
+     */
+    if (maxSpendUsd > 0 && unpricedTurns > 0) {
+      events.emit({
+        type: "run-note",
+        runId: input.runId,
+        message:
+          `The $${maxSpendUsd.toFixed(2)} spend limit could not be checked for ${unpricedTurns} ` +
+          `${unpricedTurns === 1 ? "turn" : "turns"}: that model reports no cost and publishes no ` +
+          `price. Those turns were counted as $0, which is an assumption rather than a measurement.`,
+      });
+    }
+
     events.emit({
       type: "run-finish",
       runId: input.runId,
-      reason: reason === "limit" || reason === "length" ? "length" : reason,
+      // Passed through as itself. Every earlier value here was mapped onto
+      // `FinishReason`, and that vocabulary had nowhere to put "a limit stopped
+      // this" -- so a run that hit the step limit was announced to the user as a
+      // truncated answer, which is a different and wrong thing to have happened,
+      // and the one place the claim was most confidently false.
+      reason,
       steps,
       usage,
     });

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { AgentLoop } from "./loop.js";
+import { AgentLoop, type AgentRunResult } from "./loop.js";
 import { AgentEventBus, type AgentEvent } from "./events.js";
 import { ApprovalBroker } from "./approval.js";
 import { PermissionGate } from "../permissions/gate.js";
@@ -8,7 +8,7 @@ import { ProviderError, type ProviderErrorKind } from "../providers/errors.js";
 import type { Provider, ModelRequest, StreamEvent } from "../models/provider.js";
 import { SettingsSchema } from "../settings/schema.js";
 import { EMPTY_USAGE, type FinishReason } from "../models/types.js";
-import type { TurnCostReview } from "../models/free-policy.js";
+import type { TurnCostReview, TurnSpend } from "../models/free-policy.js";
 import { describePlatform, type PlatformInfo } from "../platform/platform.js";
 
 const linux: PlatformInfo = describePlatform("linux", "x86_64", "Arch Linux");
@@ -533,6 +533,7 @@ describe("the free-only runtime guard", () => {
       ok: false,
       reason: "too expensive",
       cost: 1,
+      spend: { kind: "billed", usd: 1 } as const,
     }));
     // Discarding a real answer over a pricing surprise would be a worse lie
     // than showing it with a warning attached.
@@ -562,6 +563,7 @@ describe("the free-only runtime guard", () => {
       ok: false,
       reason: "too expensive",
       cost: 1,
+      spend: { kind: "billed", usd: 1 } as const,
     }));
     const order = events.map((event) => event.type);
     expect(order).toContain("usage");
@@ -579,6 +581,9 @@ describe("the free-only runtime guard", () => {
     const { result, events } = await runGuarded(() => ({
       ok: true,
       note: "qwen3 does not publish a per-token price.",
+      // Unpriced, but classified free -- the case where "no price" and "no
+      // charge" are the same fact and the run total can add a real zero.
+      spend: { kind: "free" } as const,
     }));
     expect(result.reason).toBe("stop");
     expect(events.some((event) => event.type === "run-error")).toBe(false);
@@ -1123,13 +1128,21 @@ describe("the runtime limit declared in settings", () => {
     expect(failure?.type === "run-error" && failure.userMessage).toMatch(/time limit/i);
   });
 
-  it("reports the limit as a stop rather than a silent cut", async () => {
-    // A run that just ends looks to the UI like the model finished. The reason
-    // has to say the limit was what ended it, or the user cannot tell a timeout
-    // from an answer.
+  it("reports the limit as a limit rather than a failure or a finished answer", async () => {
+    // Three words were available and all three lied. "error" showed the user a
+    // red banner for their own setting; "length" showed them "your answer was cut
+    // off at the output limit" for a run that was working too slowly. `limit`
+    // says the one true thing, and the UI can act on it.
     const time = clock();
     const { result } = await runWithLimit(2, time, new AgentEventBus());
-    expect(result.reason).toBe("error");
+    expect(result.reason).toBe("limit");
+  });
+
+  it("names the limit it reached, so the setting can be found", async () => {
+    const time = clock();
+    const { seen } = await runWithLimit(2, time, new AgentEventBus());
+    const failure = seen.find((event) => event.type === "run-error");
+    expect(failure?.type === "run-error" && failure.userMessage).toContain("2s");
   });
 
   it("runs to the step limit instead, when the limit is generous", async () => {
@@ -1138,5 +1151,244 @@ describe("the runtime limit declared in settings", () => {
     // 0 means unlimited, which is what the schema documents for these limits.
     expect(result.steps).toBe(200);
     expect(result.reason).toBe("limit");
+  });
+});
+
+/**
+ * The spend limit declared in settings.
+ *
+ * It was in the schema, in the settings panel, and enforced by nothing. The
+ * version that first tried to read it compared `usage.reportedCost ?? 0` against
+ * the limit, which reads a paid turn as a free one: reported cost is absent on
+ * every provider except OpenRouter and OpenCode Zen, so the cap could only ever
+ * fire on the two providers that already report what they spend. On everything
+ * else -- and on every local model, which is where an unbounded run is most
+ * likely -- it was silently inert while the UI said it was in force.
+ *
+ * So the total is accumulated from the per-turn classification in
+ * `free-policy.ts`, which distinguishes a number the provider billed, a number
+ * calculated from published prices, a positive zero, and "cannot say".
+ */
+describe("the spend limit declared in settings", () => {
+  /**
+   * A provider that keeps calling a tool, so the run takes several turns and the
+   * total has something to accumulate. One that answered immediately could not
+   * distinguish a cap that works from a cap that never gets a second chance.
+   */
+  function chargingProvider(reportedCost: number | undefined): {
+    readonly provider: Provider;
+    readonly turns: () => number;
+  } {
+    let turns = 0;
+    return {
+      turns: () => turns,
+      provider: {
+        id: "test",
+        name: "Test",
+        baseUrl: "http://test.invalid/v1",
+        async listModels() {
+          return { models: [], fetchedAt: 0, source: "fallback" };
+        },
+        async complete() {
+          return { message: { role: "assistant", content: [{ type: "text", text: "ok" }] }, usage: EMPTY_USAGE };
+        },
+        async *stream(): AsyncIterable<StreamEvent> {
+          turns += 1;
+          yield {
+            type: "tool-call-end",
+            index: 0,
+            call: { id: `c${turns}`, name: "ping", args: {}, rawArgs: "{}" },
+          } as StreamEvent;
+          yield {
+            type: "done",
+            usage: reportedCost === undefined ? EMPTY_USAGE : { ...EMPTY_USAGE, reportedCost },
+            finishReason: "tool-calls",
+          } as StreamEvent;
+        },
+        supportsModel() {
+          return true;
+        },
+      },
+    };
+  }
+
+  function pingRegistry(): ToolRegistry {
+    const registry = new ToolRegistry();
+    registry.register({
+      name: "ping",
+      description: "Does nothing",
+      parameters: { type: "object", properties: {} },
+      categories: ["bash"],
+      modes: ["chat"],
+      execute: async () => ({ content: "pong" }),
+    });
+    return registry;
+  }
+
+  function run(
+    options: {
+      readonly maxSpendUsd: number;
+      readonly spend: (turn: number) => TurnSpend;
+      readonly maxSteps?: number;
+    },
+  ): Promise<{ result: AgentRunResult; events: AgentEvent[]; turns: () => number }> {
+    const { provider, turns } = chargingProvider(0);
+    const events = new AgentEventBus();
+    const seen: AgentEvent[] = [];
+    events.subscribe((event) => seen.push(event));
+    let turn = 0;
+    const loop = new AgentLoop({
+      provider,
+      registry: pingRegistry(),
+      gate: new PermissionGate(
+        () =>
+          SettingsSchema.parse({
+            permissions: {
+              chat: {
+                level: "ask",
+                autoApprove: { bash: true },
+                maxSpendUsd: options.maxSpendUsd,
+                maxSteps: options.maxSteps ?? 200,
+              },
+            },
+          }),
+        { platform: "linux" },
+      ),
+      events,
+      approval: new ApprovalBroker(),
+      reviewUsage: async () => {
+        turn += 1;
+        return { ok: true, spend: options.spend(turn) };
+      },
+    });
+    return loop
+      .run({
+        conversationId: "c1",
+        runId: "r1",
+        mode: "chat",
+        model: "paid-model",
+        system: undefined,
+        messages: [{ role: "user", content: [{ type: "text", text: "go" }] }],
+        workspace: null,
+        settings: SettingsSchema.parse({
+          permissions: {
+            chat: {
+              level: "ask",
+              autoApprove: { bash: true },
+              maxSpendUsd: options.maxSpendUsd,
+              maxSteps: options.maxSteps ?? 200,
+            },
+          },
+        }),
+        signal: new AbortController().signal,
+      })
+      .then((result) => ({ result, events: seen, turns }));
+  }
+
+  it("stops a run that reaches the limit, and says so in money", async () => {
+    // 40 cents a turn against a 1-dollar cap: the third turn crosses it. What
+    // matters is that the total spans turns, which the first implementation
+    // could not do -- it read one turn's reported cost and never more.
+    const { result, events } = await run({
+      maxSpendUsd: 1,
+      spend: () => ({ kind: "billed", usd: 0.4 }),
+    });
+
+    expect(result.reason).toBe("limit");
+    const failure = events.find((event) => event.type === "run-error");
+    expect(failure?.type === "run-error" && failure.userMessage).toMatch(
+      /1\.2000.*1\.00/s,
+    );
+  });
+
+  it("keeps going while the total is still under the limit", async () => {
+    // The guard on the change above: a cap that stops on the first turn would
+    // pass the test above too.
+    const { result, turns } = await run({
+      maxSpendUsd: 5,
+      spend: () => ({ kind: "billed", usd: 0.1 }),
+      maxSteps: 4,
+    });
+    expect(result.reason).toBe("limit");
+    // Four steps, then the step limit -- not a spend stop at 40 cents.
+    expect(turns()).toBe(4);
+    expect(result.steps).toBe(4);
+  });
+
+  it("counts estimated cost toward the cap as well as billed", async () => {
+    // OpenAI-compatible endpoints report no cost, so their turns are priced from
+    // the catalog. A cap that only watched `reportedCost` would protect nothing
+    // there, which is the whole failure being fixed.
+    const { result } = await run({
+      maxSpendUsd: 0.5,
+      spend: () => ({ kind: "estimated", usd: 0.3 }),
+    });
+    expect(result.reason).toBe("limit");
+  });
+
+  it("lets a free run go forever, because it is genuinely free", async () => {
+    // Local models report no cost and publish no price, and that is evidence
+    // rather than ignorance. Treating it as unknown -- and therefore capping or
+    // halting -- would break the common case, where there is no money at stake.
+    const { result, turns } = await run({
+      maxSpendUsd: 1,
+      spend: () => ({ kind: "free" }),
+      maxSteps: 3,
+    });
+    expect(turns()).toBe(3);
+    expect(result.reason).toBe("limit"); // the step limit, not a spend stop
+  });
+
+  it("does not halt on an unknown turn, but admits the cap did not cover it", async () => {
+    // The awkward case, and the one the earlier `?? 0` hid completely: a custom
+    // endpoint that neither reports a cost nor appears in the catalog. Halting
+    // here would make such models unusable whenever a cap is set -- a cap that
+    // defaults to on. Silently counting them as free would be worse. So the run
+    // finishes and says, once, that it could not check.
+    const { result, events } = await run({
+      maxSpendUsd: 1,
+      spend: () => ({ kind: "unknown" }),
+      maxSteps: 2,
+    });
+    expect(result.reason).toBe("limit");
+    expect(events.some((event) => event.type === "run-error")).toBe(false);
+    // Filtered to the cap's own note, because the step limit has one too and the
+    // two say different things.
+    const capNote = events
+      .filter((event) => event.type === "run-note" && /spend limit/.test(event.message))
+      .map((event) => (event.type === "run-note" ? event.message : ""));
+    expect(capNote).toHaveLength(1);
+    expect(capNote[0]).toMatch(/could not be checked for 2 turns/);
+  });
+
+  it("says nothing about the cap when it was never in play", async () => {
+    // 0 is the documented "unlimited". Announcing an unverifiable cap on a run
+    // the user never limited would be a note about nothing.
+    const { events } = await run({
+      maxSpendUsd: 0,
+      spend: () => ({ kind: "unknown" }),
+      maxSteps: 2,
+    });
+    // The step-limit note still fires -- that one is also about a setting the
+    // user set. What must not appear is a claim about a spend cap that was off.
+    expect(
+      events.some((event) => event.type === "run-note" && /spend limit/.test(event.message)),
+    ).toBe(false);
+  });
+
+  it("adds a known cost on top of an unknown one, and still admits the gap", async () => {
+    // Both facts at once, which is what a fallback chain produces: one provider
+    // bills, the next cannot say. The number is reported as far as it is known
+    // and the remainder is named, rather than the total being quietly discarded
+    // because part of it was unknowable.
+    const { events } = await run({
+      maxSpendUsd: 5,
+      spend: (turn) => (turn === 1 ? { kind: "billed", usd: 0.2 } : { kind: "unknown" }),
+      maxSteps: 2,
+    });
+    const note = events.find(
+      (event) => event.type === "run-note" && /spend limit/.test(event.message),
+    );
+    expect(note?.type === "run-note" && note.message).toMatch(/1 turn/);
   });
 });

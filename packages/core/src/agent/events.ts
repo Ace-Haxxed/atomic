@@ -9,6 +9,25 @@ import type { FinishReason, ToolCall, Usage } from "../models/types.js";
 import type { Mode } from "../settings/schema.js";
 import type { AllowList } from "../permissions/gate.js";
 
+/**
+ * How a *run* ended, as opposed to how a turn ended.
+ *
+ * Its own type rather than `FinishReason`, because `FinishReason` describes a
+ * provider's decision about one response and has no value for a limit Atomic
+ * imposed on itself. That mismatch is why a run stopped for hitting the step
+ * limit was reported as `length`: the vocabulary had nowhere to put the truth,
+ * so it borrowed the nearest word, and the UI duly told the user their answer
+ * had been cut off at the model's output limit -- for a run that had stopped
+ * because it was working too hard. `limit` says what actually happened.
+ */
+export type RunFinishReason =
+  | "stop"
+  | "tool-calls"
+  | "cancelled"
+  | "limit"
+  | "length"
+  | "error";
+
 export type AgentEvent =
   | { readonly type: "run-start"; readonly runId: string; readonly conversationId: string; readonly mode: Mode; readonly model: string }
   | { readonly type: "step-start"; readonly runId: string; readonly step: number }
@@ -59,7 +78,7 @@ export type AgentEvent =
       /** Set when the switch also changed provider, so the UI can name it. */
       readonly providerLabel?: string;
     }
-  | { readonly type: "run-finish"; readonly runId: string; readonly reason: FinishReason; readonly steps: number; readonly usage: Usage };
+  | { readonly type: "run-finish"; readonly runId: string; readonly reason: RunFinishReason; readonly steps: number; readonly usage: Usage };
 
 export type AgentEventType = AgentEvent["type"];
 

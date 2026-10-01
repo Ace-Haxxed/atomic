@@ -1762,10 +1762,10 @@ export class LocalHost implements HostApi {
               })),
             }),
         maxSteps: settings.permissions[mode].maxSteps || undefined,
-        // The block `maxSteps` came out of, so `maxRuntimeSeconds` reaches the
-        // loop too instead of sitting in settings being displayed as though it
-        // were in force. `maxSpendUsd` is deliberately not enforced here; see
-        // `AgentRunInput.settings`.
+        // The block `maxSteps` came out of, so the runtime and spend limits
+        // reach the loop too, instead of sitting in settings being displayed as
+        // though they were in force. Only the permissions are handed over: the
+        // loop has no business reading generation or notification settings.
         settings: { permissions: settings.permissions },
         ...(settings.generation.temperature !== undefined
           ? { temperature: settings.generation.temperature }

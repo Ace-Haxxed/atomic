@@ -182,6 +182,17 @@ export const PermissionModeSettingsSchema = z.object({
   /** Hard stops for a single run. 0 means unlimited. */
   maxSteps: z.number().int().min(0).default(200),
   maxRuntimeSeconds: z.number().int().min(0).default(1800),
+  /**
+   * In dollars, summed across every turn of a run. 0 means unlimited.
+   *
+   * Only enforceable from real numbers. Turn cost comes from the provider
+   * (OpenRouter, OpenCode Zen) or from published prices, and a model that
+   * reports neither is counted as unknown rather than as free: the run continues,
+   * and then says out loud that the cap could not be checked for those turns.
+   * That is the deliberate trade -- halting on an unpriceable model would make
+   * it unusable whenever a cap is set, and a cap defaults to on, while silently
+   * counting the gap as $0 is how the cap appeared to hold and did not.
+   */
   maxSpendUsd: z.number().min(0).default(5),
   /** Set only after the user acknowledges the one-time bypass warning. */
   bypassWarningAccepted: z.boolean().default(false),

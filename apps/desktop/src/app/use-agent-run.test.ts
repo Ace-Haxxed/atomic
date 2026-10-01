@@ -460,6 +460,35 @@ describe("a truncated turn", () => {
     expect(truncatedRun.status).toBe("done");
   });
 
+  it("is not flagged for a run stopped by one of the app's own limits", () => {
+    // `run-finish` used to report every limit stop as `length`, because the
+    // reason had nowhere else to put it. So hitting the step, runtime or spend
+    // limit showed the user "This answer stopped at the model's output limit, so
+    // it may be incomplete" -- a confident and wrong explanation of a run that
+    // had simply worked too hard. The reason is now its own value, and this is
+    // what that buys: the message does not appear, and the limit's own
+    // explanation does.
+    for (const reason of ["limit", "error", "cancelled"] as const) {
+      const stopped = reduce(
+        reduce(IDLE, {
+          type: "run-start",
+          runId: "r1",
+          conversationId: "c1",
+          mode: "chat",
+          model: "m",
+        }),
+        {
+          type: "run-finish",
+          runId: "r1",
+          reason,
+          steps: 200,
+          usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+        },
+      );
+      expect(stopped.truncated, reason).toBe(false);
+    }
+  });
+
   it("is not flagged for an ordinary completion", () => {
     const done = reduce(
       reduce(IDLE, {

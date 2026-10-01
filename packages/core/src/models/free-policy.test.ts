@@ -133,7 +133,7 @@ describe("reviewTurnCost", () => {
         usage,
         policy: onlyFree,
       }),
-    ).toEqual({ ok: true, observed: "free" });
+    ).toEqual({ ok: true, observed: "free", spend: { kind: "free", usd: 0 } });
   });
 
   it("stops a turn that turned out to cost money", () => {
@@ -199,7 +199,7 @@ describe("reviewTurnCost", () => {
       policy: anything,
       freeness: "free",
     });
-    expect(result).toEqual({ ok: true });
+    expect(result).toEqual({ ok: true, observed: undefined, spend: { kind: "free" } });
   });
 
   /**
@@ -222,7 +222,11 @@ describe("reviewTurnCost", () => {
   });
 
   it("lets an unpriced turn through when the policy is off", () => {
-    expect(reviewTurnCost({ model: model(), usage, policy: anything })).toEqual({ ok: true });
+    expect(reviewTurnCost({ model: model(), usage, policy: anything })).toEqual({
+      ok: true,
+      observed: undefined,
+      spend: { kind: "unknown" },
+    });
   });
 
   /**
@@ -245,7 +249,11 @@ describe("reviewTurnCost", () => {
         usage,
         policy: anything,
       }),
-    ).toEqual({ ok: true, observed: undefined });
+    ).toEqual({
+      ok: true,
+      observed: undefined,
+      spend: { kind: "estimated", usd: 0.033 },
+    });
   });
 
   it("still stops a paid turn when free-only is on", () => {
@@ -278,7 +286,14 @@ describe("reviewTurnCost", () => {
         freeness: "paid",
         providerReportedCost: 0.4,
       }),
-    ).toEqual({ ok: true, observed: undefined });
+    ).toEqual({
+      ok: true,
+      observed: undefined,
+      // The provider's number, kept labelled as the provider's number. A total
+      // that cannot tell a catalog price from an invoice is a total nobody can
+      // read.
+      spend: { kind: "billed", usd: 0.4 },
+    });
   });
 
   it("lets a paid model charge even without a freeness classification", () => {
@@ -291,7 +306,11 @@ describe("reviewTurnCost", () => {
         policy: anything,
         providerReportedCost: 0.4,
       }),
-    ).toEqual({ ok: true, observed: undefined });
+    ).toEqual({
+      ok: true,
+      observed: undefined,
+      spend: { kind: "billed", usd: 0.4 },
+    });
   });
 
   it("still stops a reported charge when free-only is on", () => {
@@ -384,6 +403,9 @@ describe("reviewTurnCost", () => {
       ok: true,
       note: expect.stringContaining("does not publish a per-token price"),
       observed: undefined,
+      // Free by classification plus no charge reported: evidence of zero, which
+      // is why a run total may add it rather than shrug at it.
+      spend: { kind: "free" },
     });
   });
 
@@ -391,6 +413,8 @@ describe("reviewTurnCost", () => {
     expect(reviewTurnCost({ model: model({}), usage, policy: onlyFree })).toEqual({
       ok: true,
       observed: undefined,
+      // Nobody reported, nobody published, nothing classifies it free. Not zero.
+      spend: { kind: "unknown" },
     });
   });
 
@@ -402,7 +426,7 @@ describe("reviewTurnCost", () => {
         policy: onlyFree,
         providerReportedCost: 0,
       }),
-    ).toEqual({ ok: true, observed: "free" });
+    ).toEqual({ ok: true, observed: "free", spend: { kind: "billed", usd: 0 } });
   });
 
 describe("observed cost", () => {

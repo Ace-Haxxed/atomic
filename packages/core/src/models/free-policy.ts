@@ -168,6 +168,60 @@ export function turnCost(
 }
 
 /**
+ * What one turn is known to have cost.
+ *
+ * A four-way answer rather than a number, because the difference between the
+ * first two and the last two is the difference between enforcing a budget and
+ * pretending to:
+ *
+ *  - `billed`: the provider said what it charged. Evidence.
+ *  - `estimated`: the catalog's published price times this turn's tokens. A
+ *    calculation, and the best available when nothing reported.
+ *  - `free`: the provider is local by construction, or published a price of
+ *    exactly zero, or classified the model free and reported no charge. All of
+ *    those are positive evidence of nothing being charged, so this is a real
+ *    zero rather than an absence -- the case that must not be lumped in with
+ *    `unknown`, because a free local run is the app's common case and treating
+ *    it as unknowable would make the cap useless exactly where there is no money
+ *    at stake.
+ *  - `unknown`: nobody reported a cost, nobody published a price, and nothing
+ *    classifies the model as free. Atomic cannot say, and must not guess.
+ *
+ * Billed and estimated stay apart all the way to the caller. They are different
+ * kinds of claim and a running total has to know which it is made of, or it
+ * silently reports a catalog price as a bill.
+ */
+export type TurnSpend =
+  | { readonly kind: "billed" | "estimated"; readonly usd: number }
+  | { readonly kind: "free" }
+  | { readonly kind: "unknown" };
+
+/**
+ * Classify a turn's cost into a `TurnSpend`.
+ *
+ * Separate from `reviewTurnCost` so both the policy verdict and any caller that
+ * needs a running total classify the same inputs the same way. Two independent
+ * readings of "did this cost anything" is how one of them ends up wrong.
+ */
+export function turnSpend(input: {
+  readonly billed: number | undefined;
+  readonly estimated: number | null;
+  readonly freeness: Freeness | undefined;
+}): TurnSpend {
+  if (input.billed !== undefined) {
+    return { kind: "billed", usd: input.billed };
+  }
+  if (input.estimated !== null) {
+    return { kind: input.estimated === 0 ? "free" : "estimated", usd: input.estimated };
+  }
+  // No number of any kind. A free classification plus no reported charge is the
+  // one case that turns "unpriced" into "free" -- the same evidence the
+  // observed-cost memory already accepts below, so the two cannot disagree.
+  if (input.freeness === "free" || input.freeness === "free-tier") return { kind: "free" };
+  return { kind: "unknown" };
+}
+
+/**
  * What a finished step's cost review concluded.
  *
  * A union, not a string, because "the run must stop" and "the user should read
@@ -179,6 +233,8 @@ export type TurnCostReview =
   | {
       readonly ok: true;
       readonly note?: string | undefined;
+      /** What this turn is known to have cost, for a run-level budget. */
+      readonly spend: TurnSpend;
       /**
        * What this turn actually proved, for the session's observed-cost memory.
        *
@@ -190,7 +246,12 @@ export type TurnCostReview =
        */
       readonly observed?: ObservedCost | undefined;
     }
-  | { readonly ok: false; readonly reason: string; readonly cost: number | null };
+  | {
+      readonly ok: false;
+      readonly reason: string;
+      readonly cost: number | null;
+      readonly spend: TurnSpend;
+    };
 
 /**
  * The check that runs after a turn, on the number the provider actually billed.
@@ -227,6 +288,11 @@ export function reviewTurnCost(input: {
   const billed = input.providerReportedCost;
   const estimated = billed ?? turnCost(model, usage);
 
+  const classifiedFree = input.freeness === "free" || input.freeness === "free-tier";
+  // One classification, read by the verdict below and by anyone accumulating a
+  // run total, so the two cannot come to opposite conclusions about one turn.
+  const spend = turnSpend({ billed, estimated, freeness: input.freeness });
+
   /*
    * A reported charge is a fact, but a fact is not automatically a reason to
    * stop. It stops the turn when either of two things is true:
@@ -242,11 +308,11 @@ export function reviewTurnCost(input: {
    * paid models unreachable however the user configured them -- the same bug as
    * the estimate branch below, reached by a different route.
    */
-  const classifiedFree = input.freeness === "free" || input.freeness === "free-tier";
   if (billed !== undefined && billed > 0 && (policy.onlyFree || classifiedFree)) {
     return {
       ok: false,
       cost: billed,
+      spend,
       reason: classifiedFree
         ? `${model.name} is classified as free but reported a charge of $${billed.toFixed(4)} for that turn. The turn was stopped.`
         : `${model.name} reported a charge of $${billed.toFixed(4)} for that turn. The turn was stopped because free-only is on.`,
@@ -264,6 +330,7 @@ export function reviewTurnCost(input: {
     return {
       ok: false,
       cost: estimated,
+      spend,
       reason: `${model.name} cost about $${estimated.toFixed(4)} for that turn, so it is not free. The turn was stopped because free-only is on.`,
     };
   }
@@ -285,12 +352,13 @@ export function reviewTurnCost(input: {
         // treating it as one means the next turn skips the question the user
         // still has no basis to skip.
         observed: undefined,
+        spend,
       };
     }
-    return { ok: true, observed: undefined };
+    return { ok: true, observed: undefined, spend };
   }
 
   // A number, and a zero one. That is the only thing that proves a model is
   // free, so it is the only case that gets remembered.
-  return { ok: true, observed: estimated === 0 ? "free" : undefined };
+  return { ok: true, observed: estimated === 0 ? "free" : undefined, spend };
 }
