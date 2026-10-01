@@ -13,7 +13,12 @@ const LINUX: PlatformInfo = {
 
 function prompt(
   mode: Mode,
-  overrides: { workspace?: string | null; planMode?: boolean } = {},
+  overrides: {
+    workspace?: string | null;
+    planMode?: boolean;
+    browserTools?: readonly string[];
+    noQuestionsMode?: boolean;
+  } = {},
 ): string {
   return buildSystemPrompt({
     mode,
@@ -25,6 +30,12 @@ function prompt(
     projectMemory: null,
     today: new Date("2026-09-29T12:00:00Z"),
     ...(overrides.planMode === undefined ? {} : { planMode: overrides.planMode }),
+    ...(overrides.browserTools === undefined
+      ? {}
+      : { browserTools: overrides.browserTools }),
+    ...(overrides.noQuestionsMode === undefined
+      ? {}
+      : { noQuestionsMode: overrides.noQuestionsMode }),
   });
 }
 
@@ -82,6 +93,93 @@ describe("modes with tools", () => {
     const text = prompt("code", { planMode: true, workspace: "/w" });
     expect(text).toMatch(/plan mode/i);
     expect(text).toMatch(/read-only/i);
+  });
+});
+
+describe("the Cowork prompt", () => {
+  /**
+   * The claim that used to be unconditional.
+   *
+   * Cowork was described as operating a browser, told to prefer one, and told to
+   * screenshot pages when layout mattered -- with nothing registered in the
+   * `browser` category. Every answer that touched the web was a confident guess
+   * presented as verification, which is the worst way for an agent to be wrong.
+   */
+  it("states the absence of a browser rather than promising one", () => {
+    const text = prompt("cowork");
+    expect(text).not.toMatch(/operating a web browser/i);
+    expect(text).not.toMatch(/screenshot/i);
+    expect(text).toMatch(/no browser/i);
+  });
+
+  it("tells the model to stop short of guessing what a page would contain", () => {
+    // An honest "I could not check this" is useful. A plausible invented page is
+    // not, and the prompt is the only place that difference can be taught.
+    expect(prompt("cowork")).toMatch(/stop short of guessing/i);
+  });
+
+  it("describes a browser only when the registry has one to describe", () => {
+    // The other half: this is not a permanent downgrade. The day something
+    // registers a browser-category tool, the capability lines come back on their
+    // own, without this prompt being edited.
+    const text = prompt("cowork", { browserTools: ["browser_navigate", "browser_screenshot"] });
+    expect(text).toMatch(/operating a web browser/i);
+    expect(text).toMatch(/screenshot/i);
+    expect(text).not.toMatch(/no browser/i);
+  });
+
+  it("keeps the filesystem claims in both cases", () => {
+    // Only the browser is conditional. Files are real in both, and dropping that
+    // along with the browser would be a second, quieter lie.
+    expect(prompt("cowork")).toMatch(/local filesystem/i);
+    expect(prompt("cowork", { browserTools: ["browser_navigate"] })).toMatch(
+      /local filesystem/i,
+    );
+  });
+
+  it("keeps the safety rules in both cases", () => {
+    for (const browserTools of [[], ["browser_navigate"]]) {
+      const text = prompt("cowork", { browserTools });
+      expect(text).toMatch(/never enter credentials/i);
+      expect(text).toMatch(/including anything that failed/i);
+    }
+  });
+});
+
+describe("the never-ask-clarifying-questions switch", () => {
+  it("is absent by default, so the model may still ask", () => {
+    // The guard on the change below: the setting defaults to false, and a prompt
+    // that always carried this line would make the switch a decoration.
+    expect(prompt("code")).not.toMatch(/clarifying questions/i);
+  });
+
+  it("tells the model to assume and continue when it is on", () => {
+    const text = prompt("code", { noQuestionsMode: true });
+    expect(text).toMatch(/clarifying questions/i);
+    expect(text).toMatch(/state the assumption/i);
+  });
+
+  it("says what to do when the task genuinely cannot start", () => {
+    // "Never ask" has to mean "proceed anyway", not "refuse to answer anything
+    // ambiguous" -- which is its own unhelpful silence.
+    expect(prompt("code", { noQuestionsMode: true })).toMatch(
+      /do the part that is unblocked/i,
+    );
+  });
+
+  it("exempts permission prompts from itself", () => {
+    // The line that stops this from becoming an auto-approve switch. A user who
+    // wants fewer interruptions should not get them by losing the prompts that
+    // gate the agent's writes.
+    const text = prompt("code", { noQuestionsMode: true });
+    expect(text).toMatch(/permission prompts/i);
+    expect(text).toMatch(/still asks/i);
+  });
+
+  it("applies to every mode, not just the one that mentions ambiguity", () => {
+    for (const mode of ["chat", "code", "cowork"] as const) {
+      expect(prompt(mode, { noQuestionsMode: true }), mode).toMatch(/clarifying questions/i);
+    }
   });
 });
 

@@ -7,6 +7,7 @@
 
 import type { FinishReason, ToolCall, Usage } from "../models/types.js";
 import type { Mode } from "../settings/schema.js";
+import type { AllowList } from "../permissions/gate.js";
 
 export type AgentEvent =
   | { readonly type: "run-start"; readonly runId: string; readonly conversationId: string; readonly mode: Mode; readonly model: string }
@@ -15,7 +16,7 @@ export type AgentEvent =
   | { readonly type: "reasoning-delta"; readonly runId: string; readonly messageId: string; readonly text: string }
   | { readonly type: "assistant-message"; readonly runId: string; readonly messageId: string; readonly text: string; readonly finishReason: FinishReason }
   | { readonly type: "tool-call"; readonly runId: string; readonly messageId: string; readonly call: ToolCall; readonly summary: string }
-  | { readonly type: "tool-approval-requested"; readonly runId: string; readonly callId: string; readonly tool: string; readonly args: Record<string, unknown>; readonly summary: string; readonly suggestion?: string }
+  | { readonly type: "tool-approval-requested"; readonly runId: string; readonly callId: string; readonly tool: string; readonly args: Record<string, unknown>; readonly mode: Mode; readonly summary: string; readonly suggestion?: string; readonly suggestionList?: AllowList }
   | { readonly type: "tool-approval-resolved"; readonly runId: string; readonly callId: string; readonly decision: "allow" | "deny"; readonly rule: string }
   | { readonly type: "tool-result"; readonly runId: string; readonly callId: string; readonly tool: string; readonly isError: boolean; readonly summary: string; readonly display?: unknown }
   | { readonly type: "usage"; readonly runId: string; readonly usage: Usage; readonly model: string }

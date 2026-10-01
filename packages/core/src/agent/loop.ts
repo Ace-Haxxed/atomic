@@ -28,7 +28,7 @@ import type { ToolRegistry, ToolResult } from "../tools/registry.js";
 import { compactMessages, planCompaction, type CompactionOptions } from "./compaction.js";
 import type { TurnCostReview } from "../models/free-policy.js";
 import type { AgentEventBus, AgentEvent } from "./events.js";
-import type { Mode } from "../settings/schema.js";
+import type { Mode, Settings } from "../settings/schema.js";
 import type { ApprovalBroker, ApprovalDecision } from "./approval.js";
 
 export interface AgentRunDeps {
@@ -137,6 +137,15 @@ export interface AgentRunInput {
   readonly maxOutputTokens?: number | undefined;
   readonly reasoningEffort?: ReasoningEffort;
   readonly maxSteps?: number;
+  /**
+   * The mode's permission settings, passed through so run limits declared
+   * alongside a mode (e.g. `maxSteps`/`maxRuntimeSeconds`) are enforced in the
+   * loop rather than only exposed in the UI. Spend caps are intentionally not
+   * enforced by a naive "billed > limit" comparison because reported cost is not
+   * always present and cannot be safely accumulated from partial turn reports
+   * without conflating estimates with billed amounts.
+   */
+  readonly settings?: Pick<Settings, "permissions">;
   readonly signal: AbortSignal;
   /** Skip the runtime model fallback for this run (e.g. the user pinned a model). */
   readonly allowModelFallback?: boolean;
@@ -191,14 +200,23 @@ export class AgentLoop {
 
   async run(input: AgentRunInput): Promise<AgentRunResult> {
     const { provider, registry, gate, events, approval } = this.#deps;
-    const maxSteps = input.maxSteps ?? 200;
+    const modeSettings = input.settings?.permissions?.[input.mode];
+    const maxSteps = input.maxSteps ?? modeSettings?.maxSteps ?? 200;
+    const maxRuntimeMs = modeSettings?.maxRuntimeSeconds
+      ? modeSettings.maxRuntimeSeconds * 1000
+      : 0;
     const tools = registry.specs(input.mode);
+    // The repo's own clock, so the limit below is observable rather than only
+    // reachable by waiting. `Date.now` would make this untestable without a
+    // 30-minute test.
+    const now = this.#deps.now ?? Date.now;
 
     const working: ModelMessage[] = [...input.messages];
     let usage: Usage = EMPTY_USAGE;
     let steps = 0;
     let reason: AgentRunResult["reason"] = "stop";
     let noted = false;
+    const startedAt = now();
 
     events.emit({
       type: "run-start",
@@ -217,6 +235,17 @@ export class AgentLoop {
         }
         if (steps >= maxSteps) {
           reason = "limit";
+          break;
+        }
+        if (maxRuntimeMs > 0 && now() - startedAt >= maxRuntimeMs) {
+          events.emit({
+            type: "run-error",
+            runId: input.runId,
+            message: "The run reached the time limit set in settings.",
+            userMessage: "The run reached the time limit set in settings.",
+            kind: "provider",
+          });
+          reason = "error";
           break;
         }
         steps++;
@@ -650,8 +679,15 @@ export class AgentLoop {
           callId: call.id,
           tool: call.name,
           args: call.args,
+          mode: input.mode,
           summary: outcome.reason,
           ...(outcome.allowSuggestion ? { suggestion: outcome.allowSuggestion } : {}),
+          // Only forwarded alongside a value. A list with nothing to put in it
+          // is noise, and a value with no list cannot be persisted -- so the two
+          // travel as a pair and the host refuses to act on half of one.
+          ...(outcome.allowSuggestion && outcome.allowSuggestionList
+            ? { suggestionList: outcome.allowSuggestionList }
+            : {}),
         });
         const decision: ApprovalDecision = input.approve
           ? (await input.approve(call, outcome))
@@ -662,8 +698,12 @@ export class AgentLoop {
               callId: call.id,
               tool: call.name,
               args: call.args,
+              mode: input.mode,
               summary: outcome.reason,
               ...(outcome.allowSuggestion ? { suggestion: outcome.allowSuggestion } : {}),
+              ...(outcome.allowSuggestion && outcome.allowSuggestionList
+                ? { suggestionList: outcome.allowSuggestionList }
+                : {}),
               signal: input.signal,
             });
         // "allow-always" is an allow. It was compared against `"allow"` alone for

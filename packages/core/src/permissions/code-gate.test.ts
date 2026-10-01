@@ -11,7 +11,7 @@
 
 import { describe, expect, it } from "vitest";
 import { PermissionGate } from "./gate.js";
-import { isReadOnlyTool } from "./gate.js";
+import { isReadOnlyTool, READ_ONLY_TOOL_NAMES } from "./gate.js";
 import { SettingsSchema, type Settings, type Mode } from "../settings/schema.js";
 import { createCodeTools } from "../tools/index.js";
 import type { FileSystemPort, ProcessPort } from "../host/ports.js";
@@ -343,6 +343,25 @@ describe("read-only classification", () => {
     for (const tool of tools()) {
       const declared = tool.categories.includes("file-write") || tool.categories.includes("bash");
       expect(isReadOnlyTool(tool.name), tool.name).toBe(!declared);
+    }
+  });
+
+  it("names no tool that does not exist", () => {
+    // The other direction, and the one that actually caught the drift: the list
+    // above carried `web_search`, `web_fetch`, `todo_read` and `memory_read`,
+    // none of which any host registers. The test above could not see that -- it
+    // walks the registry and never looks at names the registry does not have --
+    // so a read-only allowlist could name four permissions that had been granted
+    // to nothing and no test would notice.
+    //
+    // `add_folder` is registered by the desktop bootstrap rather than by
+    // `createCodeTools`, and is deliberately not read-only, so it is not
+    // expected here either.
+    const registered = new Set(tools().map((tool) => tool.name));
+    for (const name of READ_ONLY_TOOL_NAMES) {
+      expect(registered.has(name), `${name} is allowlisted as read-only but not registered`).toBe(
+        true,
+      );
     }
   });
 

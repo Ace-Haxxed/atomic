@@ -999,3 +999,144 @@ describe("resolving a tool approval", () => {
     expect(written).toEqual([]);
   });
 });
+
+/**
+ * The runtime limit declared in settings.
+ *
+ * `maxRuntimeSeconds` sat in the settings schema, was shown in a panel, and was
+ * read by nothing: a runaway Cowork run had no stop of its own and the only way
+ * out was the cancel button. Unlike `maxSpendUsd` this one is enforced honestly,
+ * because a clock needs no external evidence to be believed -- there is no
+ * equivalent of "the provider declined to say what it cost" for elapsed time.
+ */
+describe("the runtime limit declared in settings", () => {
+  /**
+   * A provider that keeps asking for tool calls, so a run stays alive until the
+   * limit stops it. One that answered immediately would finish before any clock
+   * could matter and would pass whether or not the check exists.
+   */
+  function endlessProvider(onStep: () => void): Provider {
+    let turn = 0;
+    return {
+      id: "test",
+      name: "Test",
+      baseUrl: "http://test.invalid/v1",
+      async listModels() {
+        return { models: [], fetchedAt: 0, source: "fallback" };
+      },
+      async complete() {
+        return { message: { role: "assistant", content: [{ type: "text", text: "ok" }] }, usage: EMPTY_USAGE };
+      },
+      async *stream(): AsyncIterable<StreamEvent> {
+        turn += 1;
+        onStep();
+        yield {
+          type: "tool-call-end",
+          index: 0,
+          call: { id: `c${turn}`, name: "ping", args: {}, rawArgs: "{}" },
+        } as StreamEvent;
+        yield { type: "done", usage: EMPTY_USAGE, finishReason: "tool-calls" } as StreamEvent;
+      },
+      supportsModel() {
+        return true;
+      },
+    };
+  }
+
+  function pingRegistry(): ToolRegistry {
+    const registry = new ToolRegistry();
+    registry.register({
+      name: "ping",
+      description: "Does nothing",
+      parameters: { type: "object", properties: {} },
+      categories: ["bash"],
+      modes: ["chat"],
+      // Auto-approved so the run never waits on a human: the thing that stops
+      // this run has to be the limit, not an unanswered prompt.
+      execute: async () => ({ content: "pong" }),
+    });
+    return registry;
+  }
+
+  /** A clock the run reads, advanced only when the provider is called. */
+  function clock() {
+    let value = 0;
+    return {
+      now: () => value,
+      advance: (ms: number) => {
+        value += ms;
+      },
+    };
+  }
+
+  function runWithLimit(
+    maxRuntimeSeconds: number,
+    time: ReturnType<typeof clock>,
+    events: AgentEventBus,
+  ): Promise<{ result: Awaited<ReturnType<AgentLoop["run"]>>; seen: AgentEvent[] }> {
+    const seen: AgentEvent[] = [];
+    events.subscribe((event) => seen.push(event));
+    const loop = new AgentLoop({
+      provider: endlessProvider(() => time.advance(1_000)),
+      registry: pingRegistry(),
+      gate: new PermissionGate(
+        () =>
+          SettingsSchema.parse({
+            permissions: {
+              chat: { level: "ask", autoApprove: { bash: true }, maxRuntimeSeconds },
+            },
+          }),
+        { platform: "linux" },
+      ),
+      events,
+      approval: new ApprovalBroker(),
+      now: time.now,
+    });
+    return loop
+      .run({
+        conversationId: "c1",
+        mode: "chat",
+        model: "m",
+        system: "s",
+        messages: [{ role: "user", content: [{ type: "text", text: "go" }] }],
+        workspace: null,
+        // The block the host passes in production. Carrying the limit here is the
+        // whole wiring: the gate's own copy is a separate object, and the loop
+        // reads the one it is handed.
+        settings: SettingsSchema.parse({
+          permissions: { chat: { level: "ask", autoApprove: { bash: true }, maxRuntimeSeconds } },
+        }),
+        signal: new AbortController().signal,
+      })
+      .then((result) => ({ result, seen }));
+  }
+
+  it("stops a run that has been going longer than the limit", async () => {
+    // The clock advances one second per step, so a 3-second limit is crossed on
+    // the fourth. Without the check this loop would run until `maxSteps` (200),
+    // which is what it did before.
+    const time = clock();
+    const { result, seen } = await runWithLimit(3, time, new AgentEventBus());
+
+    expect(result.steps).toBeLessThan(200);
+    const failure = seen.find((event) => event.type === "run-error");
+    expect(failure?.type === "run-error" && failure.userMessage).toMatch(/time limit/i);
+  });
+
+  it("reports the limit as a stop rather than a silent cut", async () => {
+    // A run that just ends looks to the UI like the model finished. The reason
+    // has to say the limit was what ended it, or the user cannot tell a timeout
+    // from an answer.
+    const time = clock();
+    const { result } = await runWithLimit(2, time, new AgentEventBus());
+    expect(result.reason).toBe("error");
+  });
+
+  it("runs to the step limit instead, when the limit is generous", async () => {
+    const time = clock();
+    const { result } = await runWithLimit(0, time, new AgentEventBus());
+    // 0 means unlimited, which is what the schema documents for these limits.
+    expect(result.steps).toBe(200);
+    expect(result.reason).toBe("limit");
+  });
+});

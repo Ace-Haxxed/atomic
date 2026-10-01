@@ -24,7 +24,7 @@ import {
 import { AgentEventBus, type AgentEvent } from "../agent/events.js";
 import { buildSystemPrompt, deriveTitle } from "../agent/system-prompt.js";
 import { AuditLog, type AuditRow } from "../audit/audit-log.js";
-import { PermissionGate } from "../permissions/gate.js";
+import { PermissionGate, type AllowList } from "../permissions/gate.js";
 import { ZenProvider } from "../providers/zen/provider.js";
 import {
   OllamaProvider,
@@ -1634,7 +1634,22 @@ export class LocalHost implements HostApi {
       projectMemory,
       today: new Date(this.#now()),
       tools: this.#registry.names(mode),
+      // Read from the same registry that will serve the run, so the prompt can
+      // only describe a browser if one is actually reachable. Hard-coding this
+      // as `true` is what had Cowork telling the model to screenshot pages it
+      // had no way to open.
+      browserTools: this.#registry
+        .list(mode)
+        .filter((tool) => tool.categories.includes("browser"))
+        .map((tool) => tool.name),
       planMode: settings.permissions[mode].level === "plan",
+      // A switch that read its own label out of a schema nobody consulted. It is
+      // enforced in the prompt rather than in the gate on purpose: a clarifying
+      // question is something the model *chooses to say*, so only the prompt can
+      // stop it. Permissions are the gate's business and this setting must never
+      // reach them -- a run that cannot ask a question is not a run allowed to
+      // skip an approval.
+      noQuestionsMode: settings.permissions[mode].noQuestionsMode,
     });
 
     const gate = new PermissionGate(() => this.#settings.get(), {
@@ -1747,6 +1762,11 @@ export class LocalHost implements HostApi {
               })),
             }),
         maxSteps: settings.permissions[mode].maxSteps || undefined,
+        // The block `maxSteps` came out of, so `maxRuntimeSeconds` reaches the
+        // loop too instead of sitting in settings being displayed as though it
+        // were in force. `maxSpendUsd` is deliberately not enforced here; see
+        // `AgentRunInput.settings`.
+        settings: { permissions: settings.permissions },
         ...(settings.generation.temperature !== undefined
           ? { temperature: settings.generation.temperature }
           : {}),
@@ -1825,11 +1845,48 @@ export class LocalHost implements HostApi {
     return Promise.resolve(this.#approval.list());
   }
 
-  resolveApproval(
+  /**
+   * Record the standing grant behind "allow always", then resolve the request.
+   *
+   * The order matters. `resolve` drops the pending entry, so the suggestion has
+   * to be read first -- asking the broker afterwards always comes back empty, and
+   * the write would have to be skipped exactly when the user asked for one.
+   *
+   * A suggestion with no list is not written. The three lists are matched
+   * differently and a value in the wrong one is a grant that never applies,
+   * which is the failure this whole path exists to remove.
+   */
+  async resolveApproval(
     callId: string,
     decision: ApprovalDecision,
   ): Promise<boolean> {
-    return Promise.resolve(this.#approval.resolve(callId, decision));
+    if (decision === "allow-always") {
+      const pending = this.#approval.list().find((entry) => entry.callId === callId);
+      if (pending?.suggestion && pending.suggestionList) {
+        await this.#rememberAllowed(pending.suggestionList, pending.suggestion, pending.mode);
+      }
+    }
+    return this.#approval.resolve(callId, decision);
+  }
+
+  /**
+   * Append one entry to a per-mode allow-list, without duplicating it.
+   *
+   * Skipped when the value is already allowed, so approving the same command
+   * twice does not grow the list -- a list that only ever grows is how a
+   * once-narrow grant turns into a broad one nobody re-reads.
+   *
+   * The deny lists are deliberately not consulted. They are checked ahead of the
+   * allow lists on every call, so an entry the user just added cannot grant
+   * anything they have denied, and refusing to write it would make the button
+   * appear broken rather than saying the rule that overrode it.
+   */
+  async #rememberAllowed(list: AllowList, value: string, mode: Mode): Promise<void> {
+    const settings = this.#settings.get();
+    const existing = settings.permissions[mode][list];
+    if (!existing.includes(value)) {
+      await this.#settings.setPermission(mode, { [list]: [...existing, value] });
+    }
   }
 
   // ---- tools & audit ---------------------------------------------------

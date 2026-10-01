@@ -8,16 +8,32 @@
  */
 
 import { ProviderError } from "../providers/errors.js";
+import type { AllowList } from "../permissions/gate.js";
+import type { Mode } from "../settings/schema.js";
 
 export interface ApprovalRequest {
   readonly runId: string;
   readonly callId: string;
   readonly tool: string;
   readonly args: Record<string, unknown>;
+  /**
+   * The mode the call was made in, so a standing grant from "always allow" is
+   * written to the allow-list the user was actually working in.
+   */
+  readonly mode: Mode;
   /** Human-readable line shown on the button in the notification. */
   readonly summary: string;
   /** Value the user can permanently allow. */
   readonly suggestion?: string;
+  /**
+   * Which allow-list `suggestion` belongs in.
+   *
+   * Carried with the value rather than left for the host to infer, because the
+   * host has to write the entry to one specific list to make "always allow"
+   * mean anything, and it cannot tell from a command line or a URL whether the
+   * user meant a command, a domain or a path.
+   */
+  readonly suggestionList?: AllowList;
   readonly signal?: AbortSignal;
 }
 

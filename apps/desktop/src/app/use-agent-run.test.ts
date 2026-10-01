@@ -84,6 +84,7 @@ describe("reduce", () => {
         callId: "call-1",
         tool: "bash",
         args: { command: "ls" },
+        mode: "code",
         summary: "ls",
       },
     );
@@ -164,6 +165,7 @@ describe("reduce", () => {
       callId: "c1",
       tool: "bash",
       args: { command: "rm -rf build" },
+      mode: "code",
       summary: "rm -rf build",
       suggestion: "rm -rf build",
     });

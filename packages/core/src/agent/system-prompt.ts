@@ -24,8 +24,29 @@ export interface SystemPromptInput {
   readonly projectMemory: string | null;
   readonly today: Date;
   readonly tools?: readonly string[];
+  /**
+   * Tools that can drive a web browser, taken from the registry that will serve
+   * this run.
+   *
+   * Named explicitly rather than sniffed out of `tools`, because the difference
+   * between "has a browser" and "does not" is the difference between an accurate
+   * prompt and one that sends the model looking for a capability it was promised
+   * and never given. Empty today; the browser lines reappear on their own the
+   * day something registers a tool in the `browser` category.
+   */
+  readonly browserTools?: readonly string[];
   /** Read-only first pass. */
   readonly planMode?: boolean;
+  /**
+   * The mode's "never ask clarifying questions" switch.
+   *
+   * Enforced here because this is the only place that can enforce it: a
+   * clarifying question is text the model chooses to emit, and the gate decides
+   * permissions, not conversation. Note what it does *not* reach -- an approval
+   * prompt is not a clarifying question, and a mode with this on still stops for
+   * every permission it always stopped for.
+   */
+  readonly noQuestionsMode?: boolean;
 }
 
 export function buildSystemPrompt(input: SystemPromptInput): string {
@@ -52,13 +73,14 @@ export function buildSystemPrompt(input: SystemPromptInput): string {
     }).`,
   );
 
-  sections.push(
-    `# Mode\n${modeGuidance(
-      input.mode,
-      input.planMode === true,
-      Boolean(input.workspace),
-    )}`,
+  const modeLines = modeGuidance(
+    input.mode,
+    input.planMode === true,
+    Boolean(input.workspace),
+    input.browserTools ?? [],
   );
+  sections.push(`# Mode\n${modeLines}`);
+  if (input.noQuestionsMode) sections.push(NO_QUESTIONS_GUIDANCE);
 
   if (input.workspace) {
     sections.push(
@@ -92,6 +114,26 @@ export function buildSystemPrompt(input: SystemPromptInput): string {
   return sections.join("\n\n");
 }
 
+/**
+ * The "never ask clarifying questions" instruction.
+ *
+ * A separate section rather than another bullet inside the mode's, because it
+ * cuts across modes: it says nothing about Code's codebase or Cowork's browser,
+ * only about what the model does with a request it cannot fully resolve.
+ *
+ * The last line is the part that matters. A user who turns this on is asking for
+ * fewer interruptions, and the easy way to deliver that is to start waving
+ * through the prompts -- which trades a small annoyance for the one thing the
+ * approval prompt exists to prevent. Naming the boundary keeps this switch from
+ * quietly becoming an auto-approve switch.
+ */
+const NO_QUESTIONS_GUIDANCE = [
+  "## Never ask clarifying questions",
+  "- Make your own call on anything ambiguous and keep going. State the assumption you made and carry on; do not stop to ask.",
+  "- If a task genuinely cannot be started without an answer, do the part that is unblocked and name what you skipped.",
+  "- This applies to questions in your replies. It does not apply to permission prompts: anything requiring approval still asks.",
+].join("\n");
+
 function pathRulesFor(platform: PlatformInfo, workspace: string | null): string {
   const lines: string[] = [];
   if (platform.os === "windows") {
@@ -122,7 +164,12 @@ function pathRulesFor(platform: PlatformInfo, workspace: string | null): string 
   return lines.join("\n");
 }
 
-function modeGuidance(mode: Mode, planOnly: boolean, hasWorkspace: boolean): string {
+function modeGuidance(
+  mode: Mode,
+  planOnly: boolean,
+  hasWorkspace: boolean,
+  browserTools: readonly string[],
+): string {
   if (planOnly) {
     return [
       "You are in **plan mode**. Investigate and propose, but do not modify anything.",
@@ -142,14 +189,34 @@ function modeGuidance(mode: Mode, planOnly: boolean, hasWorkspace: boolean): str
         "- Run the project's tests or type checks after making changes, and report failures honestly.",
         "- When a task is ambiguous, state your assumption briefly and continue rather than stopping.",
       ].join("\n");
-    case "cowork":
-      return [
-        "You are in **Cowork mode**, operating a web browser and the local filesystem on the user's behalf.",
+    case "cowork": {
+      // Built as a list rather than a literal because one of these lines is only
+      // true when a browser tool exists. It used to be unconditional, so the one
+      // mode built around capabilities was the one mode lying about having them:
+      // the model was told to prefer a browser and to screenshot pages, with
+      // nothing to do either, and every answer that touched the web was a
+      // confident guess.
+      const lines = [
+        browserTools.length > 0
+          ? "You are in **Cowork mode**, operating a web browser and the local filesystem on the user's behalf."
+          : "You are in **Cowork mode**, working with the local filesystem on the user's behalf.",
         "- Plan briefly, then execute. Work in observable steps so the user can follow along.",
-        "- Prefer the browser over guessing: verify by navigating, reading the page, and screenshotting when layout matters.",
+      ];
+      if (browserTools.length > 0) {
+        lines.push(
+          "- Prefer the browser over guessing: verify by navigating, reading the page, and screenshotting when layout matters.",
+        );
+      } else {
+        lines.push(
+          "- You have no browser in this session. If the task needs one, say that plainly and stop short of guessing at what a page would contain. Report what you verified from files and commands, and what you could not check.",
+        );
+      }
+      lines.push(
         "- Never enter credentials or submit payments without an explicit instruction to do so.",
         "- Summarise what you did at the end, including anything that failed.",
-      ].join("\n");
+      );
+      return lines.join("\n");
+    }
     case "chat":
     default:
       return [

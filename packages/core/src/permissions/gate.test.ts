@@ -296,6 +296,57 @@ describe("PermissionGate", () => {
     });
     const outcome = gate.check(request("code", bash, { command: "pnpm test" }));
     expect(outcome.allowSuggestion).toBe("pnpm test");
+    expect(outcome.allowSuggestionList).toBe("allowedCommands");
+  });
+
+  it("names the list a command falls back to, with no tool-supplied hint", () => {
+    // The suggestion has existed without saying where it goes. A host that had
+    // to guess would write `pnpm test` into `allowedDomains` or `allowedPaths`,
+    // neither of which is ever compared against a command line -- so the button
+    // would appear to work and grant nothing on the next call.
+    const gate = gateFor(DEFAULT_SETTINGS);
+    const bash = makeTool({ name: "bash", categories: ["bash"], execute: async () => ok("x") });
+    const outcome = gate.check(request("code", bash, { command: "pnpm test" }));
+    expect(outcome.allowSuggestion).toBe("pnpm test");
+    expect(outcome.allowSuggestionList).toBe("allowedCommands");
+  });
+
+  it("stores a URL suggestion as the host, because that is what the list matches", () => {
+    // `allowedDomains` is matched against `hostOf(url)`. Persisting the full URL
+    // would produce an entry that no call could ever satisfy.
+    const gate = gateFor(DEFAULT_SETTINGS);
+    const fetch = makeTool({
+      name: "fetch",
+      categories: ["network"],
+      modes: ["code", "chat"],
+      execute: async () => ok("x"),
+    });
+    const outcome = gate.check(request("code", fetch, { url: "https://example.com/docs" }));
+    expect(outcome.allowSuggestion).toBe("example.com");
+    expect(outcome.allowSuggestionList).toBe("allowedDomains");
+  });
+
+  it("names the list a file path belongs in", () => {
+    const gate = gateFor(DEFAULT_SETTINGS);
+    const outcome = gate.check(
+      request("code", makeTool({ categories: ["file-write"] }), { path: "/ws/src/a.ts" }),
+    );
+    expect(outcome.allowSuggestion).toBe("/ws/src/a.ts");
+    expect(outcome.allowSuggestionList).toBe("allowedPaths");
+  });
+
+  it("never offers a list without a value to put in it", () => {
+    // The pair travels together. Half of it would let a host write an empty
+    // entry, which reads as a grant and authorizes nothing.
+    const gate = gateFor(DEFAULT_SETTINGS);
+    const bare = makeTool({
+      name: "no_args",
+      categories: ["file-write"],
+      execute: async () => ok("x"),
+    });
+    const outcome = gate.check(request("code", bare, {}));
+    expect(outcome.allowSuggestion).toBeUndefined();
+    expect(outcome.allowSuggestionList).toBeUndefined();
   });
 });
 

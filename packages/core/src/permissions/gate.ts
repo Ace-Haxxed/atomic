@@ -58,7 +58,22 @@ export interface PermissionOutcome {
   readonly rule: string;
   /** A value the user can add to the allow-list if they pick "always". */
   readonly allowSuggestion?: string;
+  /**
+   * Which allow-list `allowSuggestion` belongs in.
+   *
+   * Required whenever there is a suggestion. The three lists are not
+   * interchangeable -- an entry in `allowedDomains` is matched against a host
+   * name and one in `allowedCommands` against a command line -- so persisting a
+   * suggestion without saying where it goes means guessing, and guessing here
+   * writes a standing grant into the wrong list. A suggestion the host cannot
+   * place is worse than no suggestion, because "always allow" would then look
+   * like it worked and remember nothing.
+   */
+  readonly allowSuggestionList?: AllowList;
 }
+
+/** The three per-mode allow-lists a suggestion can be written to. */
+export type AllowList = "allowedCommands" | "allowedDomains" | "allowedPaths";
 
 /**
  * Tools that never mutate the user's project, and so are safe in plan mode and
@@ -67,6 +82,15 @@ export interface PermissionOutcome {
  * `todo_write` belongs here even though it writes: it writes the agent's own
  * task list, not a file the user cares about, and a plan the model cannot
  * record is not a plan. The user's files are what plan mode protects.
+ *
+ * This used to also name `web_search`, `web_fetch`, `todo_read` and
+ * `memory_read`, none of which any host has ever registered. Harmless until it
+ * is not: a name here that no tool answers to is a hole in a list nobody can
+ * audit, and the four entries were indistinguishable from four permissions that
+ * had been granted. `READ_ONLY_TOOL_NAMES` is exported so `code-gate.test.ts`
+ * can walk it against the real toolset and fail if this set and the registry
+ * ever drift apart again -- which is the only reason to trust a hand-written
+ * list.
  */
 const READ_ONLY_TOOLS = new Set([
   "read_file",
@@ -76,16 +100,21 @@ const READ_ONLY_TOOLS = new Set([
   // One `git` tool, not three: it only ever runs status, diff, log and show.
   // The write half of git is not exposed to the model at all.
   "git",
-  "web_search",
-  "web_fetch",
-  "todo_read",
   "todo_write",
-  "memory_read",
 ]);
 
 export function isReadOnlyTool(name: string): boolean {
   return READ_ONLY_TOOLS.has(name);
 }
+
+/**
+ * The read-only names, for the test that holds this list to the registry.
+ *
+ * Exported so the drift can be caught from the outside. A list nothing can read
+ * is a list nothing can check, and this one had been quietly wrong for long
+ * enough to grow four entries for tools that do not exist.
+ */
+export const READ_ONLY_TOOL_NAMES: readonly string[] = [...READ_ONLY_TOOLS];
 
 export interface GateOptions {
   readonly platform: PlatformInfo;
@@ -289,12 +318,14 @@ function askFor(
   tool: Tool,
   reason: string,
 ): PermissionOutcome {
-  const suggestion = suggestFor(request, tool);
+  const suggested = suggestFor(request, tool);
   return {
     decision: "ask",
     reason,
     rule: "ask",
-    ...(suggestion ? { allowSuggestion: suggestion } : {}),
+    ...(suggested
+      ? { allowSuggestion: suggested.value, allowSuggestionList: suggested.list }
+      : {}),
   };
 }
 
@@ -308,15 +339,31 @@ function askFor(
  * the user actually answered. The tool returning `null` is not enough on its own,
  * because the fallbacks below would supply the path anyway.
  */
-function suggestFor(request: PermissionRequest, tool: Tool): string | undefined {
+function suggestFor(
+  request: PermissionRequest,
+  tool: Tool,
+): { value: string; list: AllowList } | undefined {
   if (isFolderAccess(tool.name)) return undefined;
-  return (
-    tool.allowSuggestion?.(request.args as never) ??
-    commandLineFromArgs(request.args) ??
-    urlFromArgs(request.args) ??
-    pathFromArgs(request.args) ??
-    undefined
-  );
+  // The list is carried alongside the value because the callers persist the
+  // pair. Checked in the same order the values used to be, so a tool call that
+  // has both a command and a path still suggests the command -- but it is now
+  // recorded as a command, which is what the allow-list check compares against.
+  const args = request.args;
+  const own = tool.allowSuggestion?.(args as never);
+  if (own) return { value: own, list: "allowedCommands" };
+  const command = commandLineFromArgs(args);
+  if (command) return { value: command, list: "allowedCommands" };
+  const url = urlFromArgs(args);
+  if (url) {
+    // Stored as the host, not the URL: `allowedDomains` is matched against a host
+    // name, so writing the full URL in would produce an entry that can never
+    // match and an "always allow" that quietly does nothing.
+    const host = hostOf(url);
+    return host ? { value: host, list: "allowedDomains" } : undefined;
+  }
+  const path = pathFromArgs(args);
+  if (path) return { value: path, list: "allowedPaths" };
+  return undefined;
 }
 
 /** The full command line, e.g. `sudo rm -rf / --no-preserve-root`. */

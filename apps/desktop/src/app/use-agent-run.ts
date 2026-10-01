@@ -221,6 +221,7 @@ export function reduce(state: RunState, event: AgentEvent): RunState {
                 callId: event.callId,
                 tool: event.tool,
                 args: event.args,
+                mode: event.mode,
                 summary: event.summary,
                 createdAt: Date.now(),
                 ...(event.suggestion ? { suggestion: event.suggestion } : {}),
