@@ -350,7 +350,20 @@ function suggestFor(
   // recorded as a command, which is what the allow-list check compares against.
   const args = request.args;
   const own = tool.allowSuggestion?.(args as never);
-  if (own) return { value: own, list: "allowedCommands" };
+  if (own) {
+    // A tool that names what its suggestion is gets it filed accordingly. The
+    // default is a command, which is every built-in tool's case and the only kind
+    // that existed before contributions could declare a browser or a path.
+    const kind = tool.allowSuggestionKind ?? "command";
+    if (kind === "domain") {
+      // As a host, because `allowedDomains` is matched against one. Filing the
+      // full URL there produces an entry no call can ever satisfy, which is an
+      // "always allow" that reports success and grants nothing.
+      const host = hostOf(own);
+      return host ? { value: host, list: "allowedDomains" } : undefined;
+    }
+    return { value: own, list: kind === "path" ? "allowedPaths" : "allowedCommands" };
+  }
   const command = commandLineFromArgs(args);
   if (command) return { value: command, list: "allowedCommands" };
   const url = urlFromArgs(args);
@@ -426,7 +439,17 @@ function hostOf(url: string): string | null {
  */
 const FOLDER_ACCESS_TOOLS = new Set(["add_folder"]);
 
-function isFolderAccess(toolName: string): boolean {
+/**
+ * Whether this tool is about granting a folder rather than touching one.
+ *
+ * Exported because "always allow" is offered nowhere else for these tools, and
+ * anything that describes the gate's suggestions -- the built-in manifest, a
+ * settings panel, a help page -- has to know that. Re-deriving the answer from a
+ * tool's arguments would eventually disagree with the gate, and the
+ * disagreement would show up as an "always allow" button on a tool that must
+ * always ask.
+ */
+export function isFolderAccess(toolName: string): boolean {
   return FOLDER_ACCESS_TOOLS.has(toolName);
 }
 

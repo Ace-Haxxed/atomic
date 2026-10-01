@@ -32,6 +32,10 @@ import type {
   Conversation,
 } from "../storage/repositories.js";
 import type { AuditRow } from "../audit/audit-log.js";
+// The registry's own summary, not a second one shaped for the panel. A parallel
+// type is a list to keep in step by hand, and this one has been wrong before in a
+// way that read as "always allow" working.
+import type { ExtensionSummary } from "../extensions/registry.js";
 
 export interface SendMessageInput {
   readonly conversationId: string;
@@ -313,6 +317,26 @@ export interface HostApi {
   listTools(
     mode: Mode,
   ): Promise<{ name: string; description: string; categories: string[] }[]>;
+
+  /**
+   * Capabilities the user can switch on and off.
+   *
+   * A summary rather than the manifest, because the panel needs a row and not a
+   * schema. `available` is separate from `enabled` on purpose and they are not
+   * interchangeable: a capability can be available on this machine and switched
+   * off by the user, or unavailable and enabled -- the latter is what an
+   * extension needing a credential the user has not entered looks like, and
+   * showing it as one or the other on its own would be a lie in both directions.
+   */
+  listExtensions(): Promise<ExtensionSummary[]>;
+  /**
+   * Switch one on or off. False when this build cannot run it at all.
+   *
+   * A `Promise` because it writes the decision. Reporting success before the
+   * write lands would let a settings panel show the new state, then quietly lose
+   * it on quit.
+   */
+  setExtensionEnabled(id: string, enabled: boolean): Promise<boolean>;
   readAudit(filter: {
     conversationId?: string;
     runId?: string;

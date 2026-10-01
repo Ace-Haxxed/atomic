@@ -291,6 +291,18 @@ export const SettingsSchema = z.object({
   mcpServers: z.array(McpServerSchema).default(() => []),
 
   /**
+   * Which extensions the user has switched off, by manifest id.
+   *
+   * A list of refusals rather than a list of approvals, so a capability that
+   * arrives in a later build is on by default -- the same as the built-in it
+   * extends -- instead of silently requiring a second opt-in. An id the user has
+   * never seen is left alone rather than treated as off, because remembering a
+   * switch for an extension that is not installed is how uninstalling something
+   * quietly turns it back on.
+   */
+  disabledExtensions: z.array(z.string().min(1).max(120)).default(() => []),
+
+  /**
    * Folders the agent may reach in addition to the open workspace.
    *
    * The workspace is chosen per conversation and is the only root a path is

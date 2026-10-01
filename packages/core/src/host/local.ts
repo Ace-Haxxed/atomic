@@ -79,8 +79,19 @@ import {
   type ApiKeySource,
   type SecretStore,
 } from "../secrets/secret-store.js";
-import { ToolRegistry } from "../tools/registry.js";
+import { ToolRegistry, type Tool } from "../tools/registry.js";
 import { createCodeTools } from "../tools/index.js";
+import {
+  ExtensionRegistry,
+  type HostCapabilities,
+  type ExtensionSummary,
+} from "../extensions/registry.js";
+import type { ExtensionManifest } from "../extensions/manifest.js";
+import {
+  contributeTools,
+  type ImplementationResolver,
+} from "../extensions/contributions.js";
+import { builtinCapabilities, manifestForBuiltins } from "../extensions/builtin.js";
 import type { ModelInfo, Provider } from "../models/provider.js";
 import {
   isAutoModel,
@@ -165,12 +176,35 @@ export interface HostServices {
   fetch?: typeof fetch;
 }
 
+/**
+ * Which host service satisfies which declared requirement.
+ *
+ * Named in one place because a manifest's `requiresService` is a claim about the
+ * app, and the app is the only thing that can answer it. A capability whose name
+ * is missing here is reported unavailable rather than assumed present.
+ */
+const SERVICE_CAPABILITIES = {
+  fs: "filesystem",
+  process: "process",
+  checkpoints: "checkpoints",
+  folders: "folders",
+  ownKeys: "ownKeys",
+} as const;
+
 export interface LocalHostOptions {
   readonly db: Database;
   readonly secrets: SecretStore;
   readonly settings: SettingsStore;
   readonly services: HostServices;
   readonly registry?: ToolRegistry;
+  /**
+   * Manifests to publish besides the built-ins.
+   *
+   * Taken rather than discovered from disk here, so the host has no opinion about
+   * where extensions live and a test can hand it a manifest directly. Connections
+   * and the settings panel are the callers that know.
+   */
+  readonly extensions?: readonly ExtensionManifest[];
   readonly audit?: AuditLog;
   readonly now?: () => number;
   readonly newId?: () => string;
@@ -198,6 +232,30 @@ export class LocalHost implements HostApi {
   #settings: SettingsStore;
   #services: HostServices;
   #registry: ToolRegistry;
+  /**
+   * Capabilities, as described things.
+   *
+   * Built-ins are published here before they are registered, so what the user can
+   * switch off, what the settings panel lists and what the prompt offers all come
+   * from one description. A second list, written by hand and kept in step by
+   * memory, is a list that drifts.
+   */
+  #extensions: ExtensionRegistry;
+  /** Tool names this host contributed, so a rebuild can take them back out. */
+  #contributed: Set<string> = new Set();
+  /**
+   * Manifests whose tools have nothing behind them.
+   *
+   * Held rather than reported once at startup, because "this build cannot run
+   * that" is a fact about the manifest and not about this moment. Kept so a host
+   * that gains an implementation later can say so instead of leaving the user
+   * with a capability the app appears to have and does not.
+   */
+  #unimplemented: Map<string, string[]> = new Map();
+  /** Where an implementation for a declared tool name comes from, if there is one. */
+  #implementations: ImplementationResolver = () => undefined;
+  /** Manifests handed in before there was anything to attach them to. */
+  #pendingManifests: ExtensionManifest[] = [];
   #audit: AuditLog;
   #conversations: ConversationRepository;
   #runs: RunRepository;
@@ -215,6 +273,18 @@ export class LocalHost implements HostApi {
     this.#settings = options.settings;
     this.#services = options.services;
     this.#registry = options.registry ?? new ToolRegistry();
+    this.#extensions = new ExtensionRegistry({
+      platform: options.services.platform,
+      // A service is present or absent, not configured: `requiresService` asks
+      // whether this build can do the thing at all. A host that supplied the port
+      // and then failed to reach the network can be found by the call failing,
+      // which produces a truthful message; pretending otherwise here would make a
+      // broken extension report itself as working.
+      services: Object.keys(SERVICE_CAPABILITIES).filter(
+        (name) => this.#services[name as keyof typeof SERVICE_CAPABILITIES] !== undefined,
+      ),
+      hasCredentialStore: true,
+    });
     this.#audit = options.audit ?? new AuditLog(options.db);
     this.#conversations = new ConversationRepository(options.db);
     this.#runs = new RunRepository(options.db);
@@ -222,7 +292,23 @@ export class LocalHost implements HostApi {
     this.#approval = new ApprovalBroker();
     this.#now = options.now ?? (() => Date.now());
     this.#newId = options.newId ?? defaultId;
+    this.#pendingManifests = [...(options.extensions ?? [])];
+
+    /*
+     * Listen first, then apply what the user has already decided.
+     *
+     * The order is the whole thing. Applying the stored switches before
+     * subscribing means the registry changes and nothing rebuilds the tool list,
+     * so the tools a user switched off stay registered -- reachable by the model,
+     * absent from the settings panel that says they are off. Each of those two
+     * facts alone would look right in a test of one of them.
+     */
+    this.#extensions.subscribe(() => this.#syncExtensionTools());
     this.#registerCodeTools();
+
+    for (const id of this.#settings.get().disabledExtensions) {
+      this.#extensions.setEnabled(id, false);
+    }
   }
 
   /**
@@ -247,24 +333,104 @@ export class LocalHost implements HostApi {
 
     const todos = new TodoRepository(this.#db);
     const folders = this.#services.folders;
-    this.#registry.registerAll(
-      createCodeTools({
-        fs,
-        process,
-        todos: {
-          read: (conversationId) => todos.list(conversationId),
-          write: (conversationId, items) =>
-            todos.replace(conversationId, items),
-        },
-        checkpoint: this.#services.checkpoints
-          ? {
-              checkpoints: this.#services.checkpoints,
-              settings: () => this.#settings.get(),
-            }
-          : undefined,
-        ...(folders ? { folders } : {}),
-      }),
-    );
+    const tools = createCodeTools({
+      fs,
+      process,
+      todos: {
+        read: (conversationId) => todos.list(conversationId),
+        write: (conversationId, items) => todos.replace(conversationId, items),
+      },
+      checkpoint: this.#services.checkpoints
+        ? {
+            checkpoints: this.#services.checkpoints,
+            settings: () => this.#settings.get(),
+          }
+        : undefined,
+      ...(folders ? { folders } : {}),
+    });
+
+    /*
+     * Through the extension registry, like everything else that can contribute a
+     * tool.
+     *
+     * The obvious version of this -- register the built-ins directly and treat
+     * extensions as a second path -- is what this call exists to avoid. It would
+     * give extensions their own enable/disable story, their own settings UI and
+     * eventually their own permission handling, and each of those would be a
+     * place where an assumption holds for built-ins and not for the rest. The
+     * implementation resolver hands back the very tool objects just built, so the
+     * manifest describes them without a second copy and the registry hands them
+     * back unchanged.
+     */
+    this.#registerExtensions(tools);
+  }
+
+  /**
+   * Publish a manifest, and register whatever it can actually run.
+   *
+   * Called for the built-ins here and, once connections exist, for every MCP
+   * server the user has configured. Both go through one path on purpose: a
+   * capability the user can switch off should be switchable because it is an
+   * extension, not because someone remembered to add it to the extension list.
+   */
+  #registerExtensions(builtinTools: readonly Tool[] = []): void {
+    const byName = new Map(builtinTools.map((tool) => [tool.name, tool]));
+    this.#implementations = (name: string) => {
+      const tool = byName.get(name);
+      return tool
+        ? { execute: tool.execute, ...(tool.parse ? { parse: tool.parse } : {}) }
+        : undefined;
+    };
+
+    for (const manifest of this.#pendingManifests) {
+      this.#extensions.discover({ label: "configured", manifest });
+    }
+    this.#pendingManifests = [];
+
+    for (const capability of builtinCapabilities(builtinTools)) {
+      this.#extensions.discover({
+        label: "builtin",
+        manifest: manifestForBuiltins(capability),
+      });
+    }
+    this.#syncExtensionTools();
+  }
+
+  /**
+   * Bring the tool registry in line with the extensions that are on.
+   *
+   * Re-run after every change, because enabling an extension has to add its tools
+   * and disabling one has to remove them: a tool left registered after its
+   * extension is off is a capability the user turned off that the model can still
+   * reach.
+   */
+  #syncExtensionTools(): void {
+    for (const name of this.#contributed) this.#registry.unregister(name);
+    this.#contributed.clear();
+    this.#unimplemented.clear();
+
+    // Availability, not activation: a capability that is switched off still has
+    // tools this build cannot run, and the settings panel has to be able to say
+    // so before the user switches it on. An extension this machine cannot run at
+    // all is excluded -- "missing tools" beside "wrong platform" is noise.
+    for (const record of this.#extensions.all()) {
+      if (record.unavailable) continue;
+      const missing = contributeTools(record.manifest, this.#implementations).unimplemented;
+      if (missing.length > 0) this.#unimplemented.set(record.manifest.id, [...missing]);
+    }
+
+    for (const record of this.#extensions.active()) {
+      // No stand-in when a tool is missing. A registered tool that returns nothing
+      // is a model reporting having done something it did not.
+      const result = contributeTools(record.manifest, this.#implementations);
+      // Existing registrations are left alone rather than replaced. Two
+      // extensions can declare the same name, and the registry already refuses to
+      // hold both; overwriting here would make which one won depend on which
+      // manifest was discovered last instead of on the report the registry makes.
+      const fresh = result.tools.filter((tool) => !this.#registry.has(tool.name));
+      if (fresh.length > 0) this.#registry.registerAll(fresh);
+      for (const tool of result.tools) this.#contributed.add(tool.name);
+    }
   }
 
   /** Runs that changed files this conversation, newest first, for the undo UI. */
@@ -1899,6 +2065,38 @@ export class LocalHost implements HostApi {
         categories: [...tool.categories],
       })),
     );
+  }
+
+  listExtensions(): Promise<ExtensionSummary[]> {
+    // `missing` rides along with the registry's own summary rather than being
+    // looked up here: a declared tool with no implementation is a fact about the
+    // manifest and the build, and recomputing it would give the panel a second
+    // answer to the same question.
+    return Promise.resolve(
+      this.#extensions.summaries().map((summary) => ({
+        ...summary,
+        missing: this.#unimplemented.get(summary.id) ?? [],
+      })),
+    );
+  }
+
+  /**
+   * Switch a capability on or off, and remember it.
+   *
+   * Persisted as a refusal rather than an approval, so the list cannot grow into a
+   * quota the user has to re-approve on every new version. An id this build
+   * cannot run at all is refused without being written: recording "off" for
+   * something that was never on would make the next install of it silently
+   * inherit the switch.
+   */
+  async setExtensionEnabled(id: string, enabled: boolean): Promise<boolean> {
+    if (!this.#extensions.setEnabled(id, enabled)) return false;
+
+    const disabled = new Set(this.#settings.get().disabledExtensions);
+    if (enabled) disabled.delete(id);
+    else disabled.add(id);
+    await this.#settings.patch({ disabledExtensions: [...disabled].sort() });
+    return true;
   }
 
   readAudit(

@@ -66,6 +66,17 @@ export interface Tool<I = Record<string, unknown>> {
   execute(args: I, context: ToolContext): Promise<ToolResult>;
   /** Suggest a value for a permission allow-list entry, e.g. `git status`. */
   readonly allowSuggestion?: (args: I) => string | null;
+  /**
+   * Which allow-list `allowSuggestion` names, and how the gate should read it.
+   *
+   * Absent means a command, which is every built-in tool's case. It has to be
+   * declared rather than inferred from the value, because the three lists are
+   * matched differently -- one against a command line, one against a host name,
+   * one against a path -- so a value filed under the wrong one is a standing
+   * grant that no later call can satisfy. A contributed tool says which it is in
+   * its manifest and the gate does the rest.
+   */
+  readonly allowSuggestionKind?: "command" | "domain" | "path";
 }
 
 export interface ToolEntry {
