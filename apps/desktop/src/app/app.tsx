@@ -48,6 +48,26 @@ import { window as hostWindow } from "../lib/host.js";
 
 type Overlay = "none" | "settings";
 
+/**
+ * How long "Already on a new chat." stays up.
+ *
+ * Long enough to be read at a glance, short enough that it is not still there
+ * when the user comes back from whatever the note interrupted. It is also
+ * announced, so this is not the only channel.
+ */
+const NEW_CHAT_NOTE_MS = 4000;
+
+/**
+ * True for the platform's "new" chord on the current keymap.
+ *
+ * `ctrlKey` on Linux/Windows, `metaKey` on macOS. Both are accepted on every
+ * platform rather than sniffed: a wrong-platform chord is harmless here, and
+ * sniffing the platform wrong is how a shortcut ends up dead on exactly the
+ * platform it was written for.
+ */
+const isNewChatChord = (event: KeyboardEvent): boolean =>
+  (event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === "n";
+
 export interface AppProps {
   readonly api: HostApi;
   /** Non-null when the database is in memory only. Never hidden from the user. */
@@ -73,6 +93,20 @@ export function App({ api, degraded = null }: AppProps) {
    */
   const [actionError, setActionError] = useState<string | null>(null);
   /**
+   * A brief "nothing changed, on purpose" note.
+   *
+   * Separate from `actionError` because it is not an error, and separate from
+   * `fatal` because the app is fine. It exists for one case: pressing New chat
+   * while already on a blank chat reuses that chat, which is correct behaviour
+   * and looks exactly like a dead button. A user who cannot tell "that did
+   * nothing" from "that is broken" will keep pressing it, or conclude the app is
+   * broken, and both are reasonable given no feedback.
+   *
+   * Cleared by a timer rather than left to the next press, so it cannot go stale
+   * and sit there explaining a press the user has forgotten.
+   */
+  const [newChatNote, setNewChatNote] = useState<string | null>(null);
+  /**
    * Bumped to remount the composer, which is how a new chat gets an empty
    * composer.
    *
@@ -84,8 +118,38 @@ export function App({ api, degraded = null }: AppProps) {
    * the button the user had just pressed.
    */
   const [draftKey, setDraftKey] = useState(0);
+  /**
+   * The open conversation, readable from callbacks that must not re-create
+   * themselves on every change.
+   */
+  const conversationRef = useRef<string | null>(null);
+  conversationRef.current = conversation?.id ?? null;
 
   const run = useAgentRun(api);
+
+  const newChatNoteTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /**
+   * Shows the reuse note, and takes it away again.
+   *
+   * One timer, held here rather than handed back to the caller: a second press
+   * while the first note is still up restarts the window instead of racing it,
+   * and clearing it on unmount stops a note outliving the window it belongs to.
+   */
+  const flashNewChatNote = useCallback((text: string) => {
+    setNewChatNote(text);
+    if (newChatNoteTimer.current !== null) clearTimeout(newChatNoteTimer.current);
+    newChatNoteTimer.current = setTimeout(() => {
+      newChatNoteTimer.current = null;
+      setNewChatNote((current) => (current === text ? null : current));
+    }, NEW_CHAT_NOTE_MS);
+  }, []);
+
+  useEffect(
+    () => () => {
+      if (newChatNoteTimer.current !== null) clearTimeout(newChatNoteTimer.current);
+    },
+    [],
+  );
 
   // ---- load settings once ------------------------------------------------
   useEffect(() => {
@@ -161,10 +225,15 @@ export function App({ api, degraded = null }: AppProps) {
    * one, which is the behaviour you want once you are actually working.
    */
   const newChat = useCallback(async () => {
+    // Read through the ref: the composer's own text does not belong in this
+    // function's dependencies, and reading state here would re-create the
+    // callback on every keystroke for no benefit.
+    const openId = conversationRef.current;
     const outcome = await startNewChat({
       api,
       mode,
       nameOf: (which) => MODE_LABELS[which],
+      isOpen: (conversationId) => conversationId === openId,
       open: async (conversationId) => {
         await openConversation(conversationId);
       },
@@ -175,11 +244,19 @@ export function App({ api, degraded = null }: AppProps) {
       // the whole window with "Atomic could not start", destroying a
       // conversation that was on screen and perfectly fine.
       setActionError(outcome.error);
+      setNewChatNote(null);
       return;
     }
     setActionError(null);
     if (outcome.draftReset) setDraftKey((key) => key + 1);
-  }, [api, mode, openConversation]);
+    if (outcome.alreadyOnNewChat === true) {
+      // The press was honoured and the state is right; there is simply nothing
+      // that moved. Say so, rather than leaving the user to guess.
+      flashNewChatNote("Already on a new chat.");
+    } else {
+      setNewChatNote(null);
+    }
+  }, [api, mode, openConversation, flashNewChatNote]);
 
   /**
    * Open the right conversation for a mode: a real chat if there is one, else the
@@ -246,6 +323,33 @@ export function App({ api, degraded = null }: AppProps) {
     },
     [api, mode, openForMode],
   );
+
+  // ---- Ctrl/Cmd+N --------------------------------------------------------
+  //
+  // A document-level listener, not a prop on the composer: the shortcut has to
+  // work wherever focus is. Deliberately NOT restricted to "focus is not in a
+  // text field" -- that would make Ctrl+N dead precisely where the user spends
+  // their time, which is in the composer, and a shortcut that only works when
+  // you are not typing is not a shortcut anyone uses.
+  //
+  // What makes it safe to take from a text field is that `isNewChatChord`
+  // requires the modifier. Bare "n" -- the only key anyone is actually typing
+  // while composing a message -- never reaches `preventDefault` and is left
+  // entirely alone.
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!isNewChatChord(event)) return;
+      // A modifier-only press with no letter alongside it is not this gesture.
+      if (event.key.length !== 1) return;
+      // Respect a handler that got there first, so this does not fight another
+      // library or the platform over the same chord.
+      if (event.defaultPrevented) return;
+      event.preventDefault();
+      void newChat();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [newChat]);
 
   // ---- turn handling -----------------------------------------------------
   // The run writes rows asynchronously; re-reading on `settledAt` is the only
@@ -633,6 +737,18 @@ export function App({ api, degraded = null }: AppProps) {
               className="border-border text-danger bg-danger/5 rounded-md border px-3 py-2 text-sm"
             >
               {actionError}
+            </p>
+          ) : null}
+          {newChatNote ? (
+            // `status` and not `alert`: nothing is wrong, and a screen reader
+            // announcing this as an alert would be telling the user an emergency
+            // where there was a deliberate no-op. `role="status"` is polite, so
+            // it does not interrupt a message being read out either.
+            <p
+              role="status"
+              className="border-border text-content-muted bg-surface-raised rounded-md border px-3 py-2 text-sm"
+            >
+              {newChatNote}
             </p>
           ) : null}
           {policyNotice ? (

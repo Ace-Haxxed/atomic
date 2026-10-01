@@ -30,6 +30,8 @@ function fakeApi(input: {
   readonly conversations?: readonly ConversationSummary[];
   readonly createFails?: boolean;
   readonly listFails?: boolean;
+  /** Stands in for the conversation already on screen. */
+  readonly openId?: string | null;
 }) {
   const calls: string[] = [];
   const api = {
@@ -55,13 +57,20 @@ async function press(input: {
   readonly mode?: Mode;
   readonly createFails?: boolean;
   readonly listFails?: boolean;
+  /** Stands in for the conversation already on screen. */
+  readonly openId?: string | null;
 }) {
   const { api, calls } = fakeApi(input);
   const opened: string[] = [];
+  // Which conversation the window is showing. Defaults to the one being
+  // reused, because "press New chat again" is the case the notice exists for;
+  // `openId` overrides it to stand in for having navigated away.
+  const openId: string | null = input.openId ?? null;
   const outcome = await startNewChat({
     api,
     mode: input.mode ?? "chat",
     nameOf: (mode) => MODE_NAMES[mode],
+    isOpen: (id) => id === openId,
     open: async (id) => {
       calls.push(`open:${id}`);
       opened.push(id);
@@ -85,10 +94,30 @@ describe("pressing New chat", () => {
   it("gives a fresh draft when it reuses an empty chat", async () => {
     const { outcome, opened } = await press({
       conversations: [summary({ id: "empty-1", messageCount: 0 })],
+      openId: "empty-1",
     });
     expect(opened).toEqual(["empty-1"]);
     expect(outcome.conversationId).toBe("empty-1");
     expect(outcome.draftReset).toBe(true);
+    // Reusing the chat that was already open is the no-op the user needs to be
+    // told about.
+    expect(outcome.alreadyOnNewChat).toBe(true);
+  });
+
+  it("does not claim a no-op when it reuses a blank chat the user had left", async () => {
+    // Same reuse, but the window was showing something else, so the press did
+    // change what is on screen and must not say otherwise.
+    const { outcome } = await press({
+      conversations: [summary({ id: "empty-1", messageCount: 0 })],
+      openId: "some-other-chat",
+    });
+    expect(outcome.conversationId).toBe("empty-1");
+    expect(outcome.alreadyOnNewChat).toBe(false);
+  });
+
+  it("does not claim a no-op when it creates a chat", async () => {
+    const { outcome } = await press({});
+    expect(outcome.alreadyOnNewChat).toBeUndefined();
   });
 
   it("keeps the mode the user is in", async () => {
@@ -136,15 +165,69 @@ describe("pressing New chat", () => {
     expect(calls).not.toContain("create:code");
   });
 
-  it("opens a real chat over an empty one when one exists", async () => {
+  it("never reopens a chat that has messages", async () => {
+    // This used to assert the opposite, and the opposite was the bug: pressing
+    // New chat returned the user's previous conversation, so the press changed
+    // nothing and the button read as dead. Restoring the last chat is what
+    // startup does; starting a new one must not do it.
     const { outcome, opened } = await press({
+      conversations: [summary({ id: "real-1", messageCount: 4 })],
+    });
+    expect(opened).toEqual(["new-1"]);
+    expect(outcome.conversationId).toBe("new-1");
+    expect(opened).not.toContain("real-1");
+  });
+
+  it("creates a blank chat when a real one is also present", async () => {
+    // With a real chat around, the startup picker hands back that chat, and
+    // reuse is not available -- so the press must create. The old code reused
+    // the "recent" pick and the button did nothing.
+    const { outcome, opened, calls } = await press({
       conversations: [
         summary({ id: "empty-1", messageCount: 0 }),
         summary({ id: "real-1", messageCount: 4 }),
       ],
     });
-    expect(opened).toEqual(["real-1"]);
-    expect(outcome.conversationId).toBe("real-1");
+    expect(calls).toContain("create:chat");
+    expect(outcome.conversationId).toBe("new-1");
+    expect(opened).toEqual(["new-1"]);
+  });
+
+  it("still prunes the surplus blank when it has to create", async () => {
+    // A leftover blank is tidied up either way, or repeated presses in this
+    // state would leave a growing pile of identical empty rows behind.
+    const { calls } = await press({
+      conversations: [
+        summary({ id: "empty-1", messageCount: 0 }),
+        summary({ id: "empty-2", messageCount: 0 }),
+        summary({ id: "real-1", messageCount: 4 }),
+      ],
+    });
+    expect(calls).toContain("delete:empty-2");
+  });
+
+  it("does not stack blanks when a real chat is present", async () => {
+    // The create path, repeated. This is the shape the bug took: the press
+    // created a row while the old blank stayed put, so a user who pressed it
+    // repeatedly collected identical empty chats.
+    const { api, calls } = fakeApi({
+      conversations: [summary({ id: "empty-1", messageCount: 0 }), summary({ id: "real-1", messageCount: 4 })],
+    });
+    const opened: string[] = [];
+    await startNewChat({
+      api,
+      mode: "chat",
+      nameOf: () => "Chat",
+      isOpen: () => false,
+      open: async (id) => {
+        calls.push(`open:${id}`);
+        opened.push(id);
+      },
+    });
+    // One press creates exactly one row. The stale blank is neither reused nor
+    // re-created, so the next press cannot find a blank to stack onto either.
+    expect(calls.filter((call) => call.startsWith("create:"))).toHaveLength(1);
+    expect(opened).toEqual(["new-1"]);
   });
 
   it("does not stack blanks", async () => {

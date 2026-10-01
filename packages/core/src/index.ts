@@ -96,6 +96,7 @@ export {
 } from "./settings/schema.js";
 export {
   SettingsStore,
+  mergeDeep,
   validateSettings,
   type SettingsListener,
 } from "./settings/store.js";

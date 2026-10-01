@@ -168,7 +168,17 @@ export type DeepPartial<T> = T extends readonly (infer U)[]
     ? { [K in keyof T]?: DeepPartial<T[K]> }
     : T;
 
-function mergeDeep(base: unknown, patch: unknown): unknown {
+/**
+ * Deep-merge a patch onto a base document.
+ *
+ * Exported because the contract it implements -- `updateSettings(patch)` returns
+ * the whole document, not the patch -- is the sort of thing a host stand-in gets
+ * wrong. A fake that returns the patch it was handed looks fine until something
+ * downstream reads a field the patch never mentioned, and then it fails as an
+ * unrelated `undefined` deep inside a component. Having one implementation means
+ * a stand-in can be faithful instead of approximating.
+ */
+export function mergeDeep(base: unknown, patch: unknown): unknown {
   if (patch === undefined) return base;
   if (patch === null) return null;
   if (Array.isArray(patch)) return patch;

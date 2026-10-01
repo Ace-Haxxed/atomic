@@ -24,6 +24,8 @@ import {
   DEFAULT_SETTINGS,
   OLLAMA_DEFAULT_ROOT,
   SettingsSchema,
+  mergeDeep,
+  type DeepPartial,
   type HostApi,
   type Settings,
 } from "@atomic/core";
@@ -113,10 +115,24 @@ function Harness({
   );
 }
 
-/** Records every settings write, so a test can prove what was persisted. */
+/**
+ * Records every settings write, so a test can prove what was persisted.
+ *
+ * `updateSettings` takes a *patch* and returns the whole document, the way
+ * `SettingsStore.patch` does. This stand-in used to return the patch verbatim,
+ * which broke the contract in a way that read as a product bug: the app stores
+ * the returned value as the live settings, so a patch carrying only
+ * `providers.ollama` left `models` undefined, and the next render of the models
+ * browser threw `Cannot read properties of undefined` from `modelFor`. The real
+ * host deep-merges, so this one does too -- via the same `mergeDeep` the store
+ * uses, rather than a second implementation of the same rule.
+ */
 function recordingApi(write: (next: Settings) => Settings = (next) => next) {
   const writes: Settings[] = [];
   const reloads: number[] = [];
+  // The document as the host currently holds it, so each patch is applied to
+  // what came before rather than to a fixed starting point.
+  let current: Settings = DEFAULT_SETTINGS;
   const api = {
     async apiKeySources() {
       return {} as Record<string, "keychain" | "env" | "none">;
@@ -125,9 +141,10 @@ function recordingApi(write: (next: Settings) => Settings = (next) => next) {
       return false;
     },
     async setApiKey() {},
-    async updateSettings(next: Settings) {
-      writes.push(next);
-      return write(next);
+    async updateSettings(patch: DeepPartial<Settings>) {
+      writes.push(patch as Settings);
+      current = SettingsSchema.parse(mergeDeep(current, patch));
+      return write(current);
     },
     async ollamaPull(_model: string, onProgress: (u: { status: string }) => void) {
       onProgress({ status: "pulling" });

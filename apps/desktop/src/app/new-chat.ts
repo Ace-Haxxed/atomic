@@ -14,6 +14,20 @@ export interface NewChatOutcome {
   readonly conversationId: string | null;
   /** Whether the composer must be remounted to start from empty. */
   readonly draftReset: boolean;
+  /**
+   * True when this press landed on the blank chat that was *already* open.
+   *
+   * This is the whole reason the button appeared broken. The reuse path is
+   * correct -- it is what stops three presses leaving three identical rows -- but
+   * it is a no-op from where the user sits: same chat, same empty transcript,
+   * no message anywhere. Every other button in the app changes something on
+   * press, so a button that reliably does nothing visible reads as a button that
+   * is not connected to anything.
+   *
+   * The caller shows a brief notice from this. It is not an error: nothing went
+   * wrong, the user just asked for a state they were already in.
+   */
+  readonly alreadyOnNewChat?: boolean;
   /** Set when the press failed. The caller shows it; it is not a launch failure. */
   readonly error?: string;
 }
@@ -34,30 +48,59 @@ export interface NewChatDeps {
    * for the caller to act on keeps the sequencing in one place.
    */
   readonly open: (conversationId: string) => Promise<void>;
+  /**
+   * Whether this conversation is the one currently on screen.
+   *
+   * Needed to tell "reused the blank chat you were already on" from "went back
+   * to a blank chat you had left", which look identical from inside this
+   * function and are opposite things to show the user.
+   */
+  readonly isOpen: (conversationId: string) => boolean;
   readonly nameOf: (mode: Mode) => string;
 }
 
 /**
  * Start a blank chat in the current mode.
  *
- * Reuses the newest empty chat when there is one, so pressing the button three
+ * Reuses the newest *empty* chat when there is one, so pressing the button three
  * times does not leave three identical rows. The draft is reset either way: the
  * reuse path is the *common* path, and it is exactly the path that used to leave
  * the composer's contents behind, because the reset only ever happened on the
  * branch that created something.
+ *
+ * Only a blank chat is ever reused. `pickConversationForMode` is a *startup*
+ * picker -- it prefers a conversation with messages, because after a restart
+ * that is what the user most likely wants back. Reusing its result here is what
+ * made the button look broken: with any real conversation in the mode, pressing
+ * New chat returned that conversation, so the press changed nothing on screen.
+ * Restoring your last chat and starting a new one are opposite intents and have
+ * to stay separate.
  */
 export async function startNewChat(deps: NewChatDeps): Promise<NewChatOutcome> {
   const { api, mode } = deps;
   try {
     const all = await api.listConversations().catch(() => []);
-    const { reuse, prune } = pickConversationForMode(all, mode);
+    const { reuse, prune, reason } = pickConversationForMode(all, mode);
     for (const id of prune) {
       // Best effort: a leftover row is untidy, not worth failing a press over.
+      // Runs on the create branch too. Skipping it there left a blank behind on
+      // every press made from a mode that also had a real chat -- which is every
+      // press a user with a history makes, so the blanks accumulated quietly.
       await api.deleteConversation(id).catch(() => undefined);
     }
-    if (reuse) {
+    // `empty-reuse` is the only reason that means "there is a blank chat to
+    // reuse". `recent` names a conversation with messages, and reusing that here
+    // would answer "New chat" with the user's previous conversation.
+    if (reuse && reason === "empty-reuse") {
       await deps.open(reuse.id);
-      return { conversationId: reuse.id, draftReset: true };
+      return {
+        conversationId: reuse.id,
+        draftReset: true,
+        // Only worth saying when the chat we landed on is the one already on
+        // screen. Landing on a blank chat the user had left behind is a real
+        // change, even if it happens to be empty.
+        alreadyOnNewChat: deps.isOpen(reuse.id),
+      };
     }
     const created = await api.createConversation({ mode });
     // See `open`: the created chat has to become the open one, not merely exist.

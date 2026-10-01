@@ -92,6 +92,12 @@ function Harness({
             api,
             mode: "chat",
             nameOf: () => "chat",
+            // Mirrors `app.tsx`, which reads the open conversation through a ref
+            // so this callback does not change on every render. It is a required
+            // dep: without it `startNewChat` cannot tell "reused the blank chat
+            // you are already on" from "went back to one you had left", and it
+            // throws instead of reusing.
+            isOpen: (id) => id === conversationId,
             open: async (id) => {
               onOpen?.(id);
               setConversationId(id);

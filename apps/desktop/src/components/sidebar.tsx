@@ -60,6 +60,20 @@ const LEVEL_TONE: Readonly<Record<PermissionLevel, "neutral" | "info" | "warning
   bypass: "danger",
 };
 
+/**
+ * The label to show when a conversation has nothing to call itself.
+ *
+ * `?? fallback` was not enough on its own: a stored `""` is not nullish, so it
+ * rendered a row with no name and no preview at all. An empty title can reach
+ * the list -- a title derived from a whitespace-only first message is the easy
+ * way in -- and a row that renders as nothing is worse than a missing one,
+ * because it looks like a rendering failure rather than an untitled chat.
+ */
+function fallbackText(value: string | null | undefined, fallback: string): string {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : fallback;
+}
+
 export interface SidebarProps {
   readonly api: HostApi;
   readonly mode: Mode;
@@ -182,11 +196,14 @@ export function Sidebar(props: SidebarProps) {
                 <span className="flex items-center gap-1.5">
                   {conversation.pinned ? <Icon name="pin" className="size-3" /> : null}
                   <span className="truncate text-xs font-medium">
-                    {conversation.title ?? "Untitled"}
+                    {/* Trimmed, not just null-checked. An empty title rendered a
+                        completely blank row -- no name, no preview -- which is
+                        indistinguishable from the list failing to load at all. */}
+                    {fallbackText(conversation.title, "Untitled")}
                   </span>
                 </span>
                 <span className="mt-0.5 block truncate text-[10px] text-content-muted">
-                  {conversation.lastPreview ?? "No messages yet"}
+                  {fallbackText(conversation.lastPreview, "No messages yet")}
                 </span>
               </button>
             </li>
